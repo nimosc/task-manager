@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>מנהל משימות</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-logo">
+          <span class="logo-icon">✓</span>
+          <span class="logo-text">משימות</span>
+        </div>
+        <button class="icon-btn" onclick="openSettings()" title="הגדרות">⚙</button>
+      </div>
+
+      <div id="active-timer-indicator"></div>
+
+      <nav id="sidebar-nav"></nav>
+
+      <div class="sidebar-footer">
+        <button class="add-client-btn" onclick="showAddClientModal()">＋ לקוח חדש</button>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main id="main-content"></main>
+
+    <!-- Task Detail Panel -->
+    <div id="task-panel"></div>
+
+  </div>
+
+  <!-- Modal -->
+  <div id="modal-overlay" class="modal-overlay hidden" onclick="handleOverlayClick(event)">
+    <div id="modal-box" class="modal-box"></div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
