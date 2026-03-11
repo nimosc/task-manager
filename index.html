@@ -4,6 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>מנהל משימות</title>
+  <link rel="icon" type="image/png" href="LOGO1.png" sizes="32x32">
+  <link rel="icon" type="image/png" href="LOGO1.png" sizes="64x64">
+  <link rel="icon" type="image/png" href="LOGO1.png" sizes="128x128">
+  <link rel="apple-touch-icon" href="LOGO1.png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,10 +17,8 @@
     <aside id="sidebar">
       <div class="sidebar-header">
         <div class="sidebar-logo">
-          <span class="logo-icon">✓</span>
-          <span class="logo-text">משימות</span>
+          <img src="Logo2.png" alt="Task Manager" class="logo-img">
         </div>
-        <button class="icon-btn" onclick="openSettings()" title="הגדרות">⚙</button>
       </div>
 
       <div id="active-timer-indicator"></div>
@@ -25,6 +27,7 @@
 
       <div class="sidebar-footer">
         <button class="add-client-btn" onclick="showAddClientModal()">＋ לקוח חדש</button>
+        <button class="icon-btn settings-footer-btn" onclick="openSettings()" title="הגדרות">⚙ הגדרות</button>
       </div>
     </aside>
 

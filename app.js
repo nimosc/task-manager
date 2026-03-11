@@ -40,11 +40,13 @@ function defaultState() {
     selectedTaskId: null,
     panelClientId: null,        // context for open task panel
     panelProjectId: null,
+    reportMonth: null,          // 'YYYY-MM' for report view; null = current month
     filters: {
       status: STATUS.OPEN,
       priority: 'all',
       tag: 'all',
-      clientId: 'all'
+      clientId: 'all',
+      sortBy: 'manual'
     }
   };
 }
@@ -115,6 +117,15 @@ function formatEstimate(minutes) {
   return `${h}:${String(m).padStart(2,'0')}`;
 }
 
+function calcBilling(secs, hourlyRate) {
+  if (!hourlyRate || hourlyRate <= 0 || secs <= 0) return null;
+  return (secs / 3600) * hourlyRate;
+}
+function formatMoney(amount) {
+  if (amount === null || amount === undefined) return '';
+  return '₪' + amount.toLocaleString('he-IL', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+}
+
 // Returns {pct, state} where state is 'ok'|'warn'|'over'
 function estimateProgress(actualSecs, estimatedMinutes) {
   if (!estimatedMinutes || estimatedMinutes <= 0) return null;
@@ -150,7 +161,11 @@ function allTodayItems() {
   for (const client of state.clients) {
     for (const project of (client.projects || [])) {
       for (const task of (project.tasks || [])) {
-        if (task.dueDate === today) result.push({ client, project, task });
+        if (task.status === STATUS.DONE) continue;
+        const isToday      = task.dueDate === today;
+        const isOverdue    = task.dueDate && task.dueDate < today;
+        const isInProgress = task.status === STATUS.IN_PROGRESS;
+        if (isToday || isOverdue || isInProgress) result.push({ client, project, task });
       }
     }
   }
@@ -193,7 +208,7 @@ function subtaskTotalTime(sub) {
 // CRUD — CLIENTS
 // ============================================================
 function addClient(data) {
-  const client = { id: uuid(), name: data.name || 'לקוח חדש', email: data.email || '', phone: data.phone || '', notes: data.notes || '', projects: [] };
+  const client = { id: uuid(), name: data.name || 'לקוח חדש', email: data.email || '', phone: data.phone || '', notes: data.notes || '', defaultHourlyRate: data.defaultHourlyRate || 0, clockifyId: null, projects: [] };
   state.clients.push(client);
   saveState();
   return client;
@@ -220,7 +235,7 @@ function deleteClient(cid) {
 function addProject(cid, data) {
   const c = getClient(cid);
   if (!c) return;
-  const p = { id: uuid(), name: data.name || 'פרויקט חדש', color: data.color || PROJECT_COLORS[0], tasks: [] };
+  const p = { id: uuid(), name: data.name || 'פרויקט חדש', color: data.color || PROJECT_COLORS[0], billable: data.billable || false, hourlyRate: data.hourlyRate || 0, clockifyId: null, tasks: [] };
   (c.projects = c.projects || []).push(p);
   saveState();
   return p;
@@ -287,6 +302,21 @@ function moveTask(tid, fromCid, fromPid, toCid, toPid) {
   saveState();
 }
 
+function reorderTask(fromTaskId, fromCid, fromPid, toTaskId, insertBefore) {
+  if (fromTaskId === toTaskId) return;
+  const proj = getProject(fromCid, fromPid);
+  if (!proj) return;
+  const tasks   = proj.tasks;
+  const fromIdx = tasks.findIndex(t => t.id === fromTaskId);
+  const toIdx   = tasks.findIndex(t => t.id === toTaskId);
+  if (fromIdx === -1 || toIdx === -1) return;
+  const [task] = tasks.splice(fromIdx, 1);
+  const newIdx  = tasks.findIndex(t => t.id === toTaskId);
+  tasks.splice(insertBefore ? newIdx : newIdx + 1, 0, task);
+  saveState();
+  render();
+}
+
 // ============================================================
 // CRUD — SUBTASKS
 // ============================================================
@@ -338,8 +368,11 @@ function startTimer(cid, pid, tid, sid = null) {
     clockifyStartEntry({
       clientName:  c?.name || '',
       projectName: p?.name || '',
+      clientId:    cid,
+      projectId:   pid,
       taskName:    s ? s.title : (t?.title || ''),
       description: s ? (s.description || '') : (t?.description || ''),
+      billable:    p?.billable || false,
       startTime
     }).then(entryId => {
       if (entryId && state.activeTimer) {
@@ -380,8 +413,11 @@ function stopTimer() {
       clockifyCreateEntry({
         clientName:  c?.name || '',
         projectName: p?.name || '',
+        clientId:    at.clientId,
+        projectId:   at.projectId,
         taskName:    s ? s.title : (t?.title || ''),
         description: s ? (s.description || '') : (t?.description || ''),
+        billable:    p?.billable || false,
         start: at.startTime, end: endTime
       });
     }
@@ -428,24 +464,24 @@ function tickTimer() {
 // ============================================================
 
 // Shared: resolve projectId (find or create client + project)
-async function clockifyResolveProject(apiKey, wsId, clientName, projectName) {
-  let clockifyClientId  = clientName  ? await clockifyUpsertClient(apiKey, wsId, clientName)  : null;
-  let clockifyProjectId = projectName ? await clockifyUpsertProject(apiKey, wsId, projectName, clockifyClientId) : null;
+async function clockifyResolveProject(apiKey, wsId, clientName, projectName, localClientId, localProjectId) {
+  let clockifyClientId  = clientName  ? await clockifyUpsertClient(apiKey, wsId, clientName, localClientId)  : null;
+  let clockifyProjectId = projectName ? await clockifyUpsertProject(apiKey, wsId, projectName, clockifyClientId, localClientId, localProjectId) : null;
   if (!clockifyProjectId) throw new Error(`לא ניתן למצוא/ליצור פרויקט "${projectName}" ב-Clockify`);
   return clockifyProjectId;
 }
 
 // Called on ▶ — opens a live running entry, returns entry ID
-async function clockifyStartEntry({ clientName, projectName, taskName, description, startTime }) {
+async function clockifyStartEntry({ clientName, projectName, clientId, projectId: localProjectId, taskName, description, billable, startTime }) {
   const apiKey = state.clockifyApiKey;
   const wsId   = CLOCKIFY_WORKSPACE;
   try {
-    const projectId = await clockifyResolveProject(apiKey, wsId, clientName, projectName);
+    const projectId = await clockifyResolveProject(apiKey, wsId, clientName, projectName, clientId, localProjectId);
     const body = {
       start: new Date(startTime).toISOString(),
       description: taskName + (description ? ': ' + description : ''),
       projectId,
-      billable: false
+      billable: billable || false
     };
     const res = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/time-entries`, {
       method: 'POST',
@@ -482,17 +518,17 @@ async function clockifyStopEntry(entryId, endTime) {
 }
 
 // Fallback: create a completed entry (used if stop is called before start resolved)
-async function clockifyCreateEntry({ clientName, projectName, taskName, description, start, end }) {
+async function clockifyCreateEntry({ clientName, projectName, clientId, projectId: localProjectId, taskName, description, billable, start, end }) {
   const apiKey = state.clockifyApiKey;
   const wsId   = CLOCKIFY_WORKSPACE;
   try {
-    const projectId = await clockifyResolveProject(apiKey, wsId, clientName, projectName);
+    const projectId = await clockifyResolveProject(apiKey, wsId, clientName, projectName, clientId, localProjectId);
     const body = {
       start: new Date(start).toISOString(),
       end:   new Date(end).toISOString(),
       description: taskName + (description ? ': ' + description : ''),
       projectId,
-      billable: false
+      billable: billable || false
     };
     const res = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/time-entries`, {
       method: 'POST',
@@ -507,42 +543,70 @@ async function clockifyCreateEntry({ clientName, projectName, taskName, descript
   }
 }
 
-async function clockifyUpsertClient(apiKey, wsId, name) {
+async function clockifyUpsertClient(apiKey, wsId, name, localClientId) {
+  // Use cached Clockify ID if available — avoids lookup by name entirely
+  if (localClientId) {
+    const localClient = getClient(localClientId);
+    if (localClient?.clockifyId) return localClient.clockifyId;
+  }
   try {
+    let id = null;
     const r = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/clients?name=${encodeURIComponent(name)}&page-size=50`, { headers: { 'X-Api-Key': apiKey } });
     if (r.ok) {
       const list = await r.json();
       const found = list.find(x => x.name.toLowerCase() === name.toLowerCase());
-      if (found) return found.id;
+      if (found) id = found.id;
     }
-    const cr = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/clients`, {
-      method: 'POST',
-      headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name })
-    });
-    if (cr.ok) { const x = await cr.json(); return x.id; }
-    console.warn('Clockify create client failed:', cr.status, await cr.text());
+    if (!id) {
+      const cr = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/clients`, {
+        method: 'POST',
+        headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      if (cr.ok) { const x = await cr.json(); id = x.id; }
+      else console.warn('Clockify create client failed:', cr.status, await cr.text());
+    }
+    // Persist ID so future calls skip the API lookup
+    if (id && localClientId) {
+      const localClient = getClient(localClientId);
+      if (localClient) { localClient.clockifyId = id; saveState(); }
+    }
+    return id;
   } catch (e) { console.warn('clockifyUpsertClient:', e); }
   return null;
 }
 
-async function clockifyUpsertProject(apiKey, wsId, name, clientId) {
+async function clockifyUpsertProject(apiKey, wsId, name, clockifyClientId, localClientId, localProjectId) {
+  // Use cached Clockify ID if available — avoids lookup by name entirely
+  if (localClientId && localProjectId) {
+    const localProject = getProject(localClientId, localProjectId);
+    if (localProject?.clockifyId) return localProject.clockifyId;
+  }
   try {
+    let id = null;
     const r = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/projects?name=${encodeURIComponent(name)}&page-size=50`, { headers: { 'X-Api-Key': apiKey } });
     if (r.ok) {
       const list = await r.json();
       const found = list.find(x => x.name.toLowerCase() === name.toLowerCase());
-      if (found) return found.id;
+      if (found) id = found.id;
     }
-    const body = { name, isPublic: false, color: '#6366f1' };
-    if (clientId) body.clientId = clientId;
-    const cr = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/projects`, {
-      method: 'POST',
-      headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    if (cr.ok) { const x = await cr.json(); return x.id; }
-    console.warn('Clockify create project failed:', cr.status, await cr.text());
+    if (!id) {
+      const body = { name, isPublic: false, color: '#6366f1' };
+      if (clockifyClientId) body.clientId = clockifyClientId;
+      const cr = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/projects`, {
+        method: 'POST',
+        headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (cr.ok) { const x = await cr.json(); id = x.id; }
+      else console.warn('Clockify create project failed:', cr.status, await cr.text());
+    }
+    // Persist ID so future calls skip the API lookup
+    if (id && localClientId && localProjectId) {
+      const localProject = getProject(localClientId, localProjectId);
+      if (localProject) { localProject.clockifyId = id; saveState(); }
+    }
+    return id;
   } catch (e) { console.warn('clockifyUpsertProject:', e); }
   return null;
 }
@@ -550,24 +614,66 @@ async function clockifyUpsertProject(apiKey, wsId, name, clientId) {
 // ============================================================
 // FILTERS
 // ============================================================
+function applySortBy(tasks) {
+  const s = state.filters.sortBy;
+  if (!s || s === 'manual') return tasks;
+  const PMAP = { high: 0, medium: 1, low: 2 };
+  return [...tasks].sort((a, b) => {
+    if (s === 'priority') return (PMAP[a.priority] ?? 1) - (PMAP[b.priority] ?? 1);
+    if (s === 'dueDate') {
+      if (!a.dueDate && !b.dueDate) return 0;
+      if (!a.dueDate) return 1;
+      if (!b.dueDate) return -1;
+      return a.dueDate.localeCompare(b.dueDate);
+    }
+    if (s === 'title') return a.title.localeCompare(b.title, 'he');
+    if (s === 'time')  return (b.timeTotal || 0) - (a.timeTotal || 0);
+    return 0;
+  });
+}
+
 function applyFilters(tasks) {
   const f = state.filters;
-  return tasks.filter(t => {
+  const filtered = tasks.filter(t => {
     if (f.status   !== 'all' && t.status   !== f.status)   return false;
     if (f.priority !== 'all' && t.priority !== f.priority) return false;
     if (f.tag      !== 'all' && !(t.tags || []).includes(f.tag)) return false;
     return true;
   });
+  return applySortBy(filtered);
 }
 
 function applyTodayFilters(items) {
   const f = state.filters;
-  return items.filter(({ client, task }) => {
-    if (f.status   !== 'all' && task.status   !== f.status)   return false;
+  // If saved clientId no longer exists in current clients, reset it to 'all'
+  const validClientId = (f.clientId && f.clientId !== 'all' && state.clients.find(c => c.id === f.clientId))
+    ? f.clientId : 'all';
+  if (validClientId !== f.clientId) { f.clientId = 'all'; saveState(); }
+
+  const filtered = items.filter(({ client, task }) => {
+    // In today view: 'open' means "not done" — both open + in-progress are relevant
+    if (f.status !== 'all') {
+      if (f.status === STATUS.OPEN) { if (task.status === STATUS.DONE) return false; }
+      else if (task.status !== f.status) return false;
+    }
     if (f.priority !== 'all' && task.priority !== f.priority) return false;
     if (f.tag      !== 'all' && !(task.tags || []).includes(f.tag)) return false;
-    if (f.clientId !== 'all' && client.id !== f.clientId)     return false;
+    if (validClientId !== 'all' && client.id !== validClientId) return false;
     return true;
+  });
+  const s = f.sortBy;
+  if (!s || s === 'manual') return filtered;
+  const PMAP = { high: 0, medium: 1, low: 2 };
+  return [...filtered].sort(({ task: a }, { task: b }) => {
+    if (s === 'priority') return (PMAP[a.priority] ?? 1) - (PMAP[b.priority] ?? 1);
+    if (s === 'dueDate') {
+      if (!a.dueDate && !b.dueDate) return 0;
+      if (!a.dueDate) return 1; if (!b.dueDate) return -1;
+      return a.dueDate.localeCompare(b.dueDate);
+    }
+    if (s === 'title') return a.title.localeCompare(b.title, 'he');
+    if (s === 'time')  return (b.timeTotal || 0) - (a.timeTotal || 0);
+    return 0;
   });
 }
 
@@ -646,21 +752,26 @@ function renderSidebar() {
   if (!nav) return;
   const isToday = state.currentView === 'today';
 
+  const isReport = state.currentView === 'report';
   let html = `
     <div class="nav-today ${isToday ? 'active' : ''}" onclick="navigateTo('today')">
       <span class="nav-today-icon">📅</span>
       <span>היום</span>
+    </div>
+    <div class="nav-today ${isReport ? 'active' : ''}" onclick="navigateTo('report')">
+      <span class="nav-today-icon">📊</span>
+      <span>דוח שעות</span>
     </div>`;
 
   for (const c of state.clients) {
-    const expanded = state.selectedClientId === c.id;
-    html += `<div class="nav-client ${expanded ? 'active' : ''}">
+    const active = state.selectedClientId === c.id;
+    html += `<div class="nav-client ${active ? 'active' : ''}">
       <div class="nav-client-header" onclick="selectClient('${c.id}')">
         <span style="font-size:15px">👤</span>
         <span class="nav-client-name">${esc(c.name)}</span>
-        <span class="nav-chevron ${expanded ? 'open' : ''}">›</span>
+        <span class="nav-chevron">›</span>
       </div>
-      ${expanded ? renderSidebarProjects(c) : ''}
+      ${renderSidebarProjects(c)}
     </div>`;
   }
   nav.innerHTML = html;
@@ -687,6 +798,7 @@ function renderMain() {
     case 'today':   el.innerHTML = renderTodayView();   break;
     case 'client':  el.innerHTML = renderClientView();  break;
     case 'project': el.innerHTML = renderProjectView(); break;
+    case 'report':  el.innerHTML = renderReportView();  break;
     default:        el.innerHTML = renderTodayView();
   }
 }
@@ -734,6 +846,124 @@ function renderTodayView() {
 // ============================================================
 // CLIENT VIEW
 // ============================================================
+// ============================================================
+// REPORT VIEW
+// ============================================================
+function renderReportView() {
+  // Month/year selector stored in state
+  if (!state.reportMonth) {
+    const now = new Date();
+    state.reportMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  }
+  const [ry, rm] = state.reportMonth.split('-').map(Number);
+  const monthStart = `${state.reportMonth}-01`;
+  const monthEnd   = new Date(ry, rm, 0).toISOString().split('T')[0]; // last day of month
+
+  // Build month options (last 12 months)
+  let monthOpts = '';
+  for (let i = 0; i < 12; i++) {
+    const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const val = `${y}-${m}`;
+    const label = d.toLocaleDateString('he-IL', { year: 'numeric', month: 'long' });
+    monthOpts += `<option value="${val}" ${val === state.reportMonth ? 'selected' : ''}>${label}</option>`;
+  }
+
+  let grandTotal = 0;
+  let grandBillable = 0;
+  let grandBilling = 0;
+  let clientsHtml = '';
+
+  for (const c of state.clients) {
+    let clientTotal = 0;
+    let clientBillable = 0;
+    let clientBilling = 0;
+    let projectsHtml = '';
+
+    for (const p of (c.projects || [])) {
+      let projTotal = 0;
+      let projBillable = 0;
+      let projBilling = 0;
+      let tasksHtml = '';
+
+      for (const t of (p.tasks || [])) {
+        // Filter: task must have dueDate in selected month (or show all if no dueDate filter desired)
+        const inMonth = !t.dueDate || (t.dueDate >= monthStart && t.dueDate <= monthEnd);
+        if (!inMonth) continue;
+        const secs = t.timeTotal || 0;
+        if (secs === 0 && t.status !== STATUS.DONE) continue; // skip tasks with no time tracked
+        projTotal += secs;
+        if (p.billable) { projBillable += secs; projBilling += (secs / 3600) * (p.hourlyRate || 0); }
+
+        const statusIcon = STATUS_ICONS[t.status] || '○';
+        const statusClass = t.status === STATUS.DONE ? 'done' : t.status === STATUS.IN_PROGRESS ? 'inprog' : '';
+        tasksHtml += `<tr class="report-task-row ${statusClass}">
+          <td class="report-task-title">${esc(t.title)}</td>
+          <td class="report-task-status"><span class="badge badge-${t.status === STATUS.DONE ? 'done' : t.status === STATUS.IN_PROGRESS ? 'inprogress' : 'open'}">${statusIcon} ${STATUS_LABELS[t.status]}</span></td>
+          <td class="report-task-time">${formatTime(secs)}</td>
+          ${p.billable && p.hourlyRate ? `<td class="report-task-billing">${formatMoney((secs/3600)*p.hourlyRate)}</td>` : '<td></td>'}
+        </tr>`;
+      }
+
+      if (projTotal === 0 && !tasksHtml) continue;
+      clientTotal += projTotal; clientBillable += projBillable; clientBilling += projBilling;
+
+      projectsHtml += `<details class="report-project" open>
+        <summary class="report-project-header">
+          <span class="project-dot sm" style="background:${p.color}"></span>
+          <span class="report-proj-name">${esc(p.name)}</span>
+          ${p.billable ? '<span class="badge-billable">חיוני</span>' : ''}
+          <span class="report-time">${formatTime(projTotal)}</span>
+          ${projBilling > 0 ? `<span class="report-billing">${formatMoney(projBilling)}</span>` : ''}
+        </summary>
+        ${tasksHtml ? `<table class="report-tasks-table">
+          <thead><tr><th>משימה</th><th>סטטוס</th><th>זמן</th><th>חיוב</th></tr></thead>
+          <tbody>${tasksHtml}</tbody>
+        </table>` : '<div class="report-empty-proj">אין משימות עם זמן מעקב</div>'}
+      </details>`;
+    }
+
+    if (clientTotal === 0 && !projectsHtml) continue;
+    grandTotal += clientTotal; grandBillable += clientBillable; grandBilling += clientBilling;
+
+    clientsHtml += `<details class="report-client-section" open>
+      <summary class="report-client-header">
+        <span class="report-client-avatar">${esc((c.name||'?').charAt(0).toUpperCase())}</span>
+        <span class="report-client-name">${esc(c.name)}</span>
+        <span class="report-client-time">${formatTime(clientTotal)}</span>
+        ${clientBilling > 0 ? `<span class="report-client-billing">${formatMoney(clientBilling)}</span>` : ''}
+      </summary>
+      <div class="report-projects-list">${projectsHtml || '<div class="report-empty-proj">אין פרויקטים עם זמן מעקב</div>'}</div>
+    </details>`;
+  }
+
+  const emptyMsg = clientsHtml ? '' : `<div class="empty-state"><div class="empty-icon">📊</div><div>אין נתוני שעות לחודש זה</div></div>`;
+
+  return `<div class="view-container report-view">
+    <div class="view-header">
+      <div class="view-header-title"><h2>📊 דוח שעות</h2></div>
+      <div class="view-actions">
+        <select class="report-month-select" onchange="setReportMonth(this.value)">${monthOpts}</select>
+      </div>
+    </div>
+    <div class="report-grand-total">
+      <span>סה"כ זמן:</span>
+      <span class="report-grand-time">${formatTime(grandTotal)}</span>
+      ${grandBillable > 0 ? `<span class="report-grand-sep">|</span><span>שעות לחיוב: ${formatTime(grandBillable)}</span>` : ''}
+      ${grandBilling > 0 ? `<span class="report-grand-sep">|</span><span class="report-grand-billing">💰 ${formatMoney(grandBilling)}</span>` : ''}
+    </div>
+    ${clientsHtml}
+    ${emptyMsg}
+  </div>`;
+}
+
+function setReportMonth(val) {
+  state.reportMonth = val;
+  saveState();
+  renderMain();
+}
+
 function renderClientView() {
   const c = getClient(state.selectedClientId);
   if (!c) return '<div class="view-container"><div class="empty-state">לקוח לא נמצא</div></div>';
@@ -745,6 +975,27 @@ function renderClientView() {
   ].join('');
 
   const projCards = (c.projects || []).map(p => renderProjectCard(c.id, p)).join('');
+
+  const clientActualSecs = (c.projects || []).reduce((sum, p) =>
+    sum + (p.tasks || []).reduce((s, t) =>
+      s + (t.timeTotal || 0) + (t.subtasks || []).reduce((ss, sub) => ss + (sub.timeTotal || 0), 0), 0), 0);
+  const clientEstMins = (c.projects || []).reduce((sum, p) =>
+    sum + (p.tasks || []).reduce((s, t) => s + (t.estimatedMinutes || 0), 0), 0);
+  const clientBillableSecs = (c.projects || []).filter(p => p.billable).reduce((sum, p) =>
+    sum + (p.tasks || []).reduce((s, t) =>
+      s + (t.timeTotal || 0) + (t.subtasks || []).reduce((ss, sub) => ss + (sub.timeTotal || 0), 0), 0), 0);
+  const clientBillingTotal = (c.projects || []).filter(p => p.billable && p.hourlyRate > 0).reduce((sum, p) => {
+    const secs = (p.tasks || []).reduce((s, t) =>
+      s + (t.timeTotal || 0) + (t.subtasks || []).reduce((ss, sub) => ss + (sub.timeTotal || 0), 0), 0);
+    return sum + (secs / 3600) * p.hourlyRate;
+  }, 0);
+  const clientTimeBar = clientActualSecs > 0 || clientEstMins > 0 ? `
+    <div class="client-time-summary">
+      <span class="time-label">סה"כ זמן:</span>
+      <span class="time-actual">⏱ ${formatTime(clientActualSecs)}</span>
+      ${clientEstMins > 0 ? `<span class="time-sep">/</span><span class="time-estimated">${formatEstimate(clientEstMins)} מתוכנן</span>` : ''}
+      ${clientBillingTotal > 0 ? `<span class="billing-amount total">💰 ${formatMoney(clientBillingTotal)}</span>` : ''}
+    </div>` : '';
 
   return `<div class="view-container">
     <div class="view-header">
@@ -760,6 +1011,7 @@ function renderClientView() {
         <div class="client-info-name">${esc(c.name)}</div>
         <div class="client-info-details">${infoDetail}</div>
         ${c.notes ? `<div class="client-notes">📝 ${esc(c.notes)}</div>` : ''}
+      ${clientTimeBar}
       </div>
     </div>
     <div class="section-header">
@@ -777,6 +1029,17 @@ function renderProjectCard(cid, p) {
   const open  = (p.tasks || []).filter(t => t.status !== STATUS.DONE).length;
   const client = getClient(cid);
   const isInbox = client?._inbox;
+  const actualSecs = (p.tasks || []).reduce((sum, t) =>
+    sum + (t.timeTotal || 0) + (t.subtasks || []).reduce((s, sub) => s + (sub.timeTotal || 0), 0), 0);
+  const estimatedMins = (p.tasks || []).reduce((sum, t) => sum + (t.estimatedMinutes || 0), 0);
+  const billing = calcBilling(actualSecs, p.hourlyRate);
+  const timeStats = actualSecs > 0 || estimatedMins > 0 || p.billable
+    ? `<div class="project-card-time">
+        ${p.billable ? `<span class="badge-billable">💰 Billable</span>` : ''}
+        <span class="time-actual">⏱ ${formatTime(actualSecs)}</span>
+        ${estimatedMins > 0 ? `<span class="time-sep">/</span><span class="time-estimated">${formatEstimate(estimatedMins)} מתוכנן</span>` : ''}
+        ${billing !== null ? `<span class="billing-amount">${formatMoney(billing)}</span>` : ''}
+       </div>` : '';
   return `<div class="project-card ${isInbox ? 'project-card-inbox' : ''}" onclick="selectProject('${cid}','${p.id}')">
     <div class="project-card-header">
       <span class="project-dot lg" style="background:${p.color}"></span>
@@ -784,6 +1047,7 @@ function renderProjectCard(cid, p) {
       ${isInbox ? '<span class="inbox-badge">ללא לקוח</span>' : ''}
     </div>
     <div class="project-card-stats">${open} פתוחות / ${total} סה"כ</div>
+    ${timeStats}
     <div class="project-card-actions" onclick="event.stopPropagation()">
       ${isInbox ? `<button class="btn-icon" onclick="showAssignClientModal('${cid}','${p.id}')" title="שייך ללקוח">🔗</button>` : ''}
       <button class="btn-icon" onclick="showEditProjectModal('${cid}','${p.id}')" title="עריכה">✏️</button>
@@ -803,6 +1067,20 @@ function renderProjectView() {
   const tags     = allProjectTags(c.id, p.id);
   const filtered = applyFilters(p.tasks || []);
 
+  const projActualSecs = (p.tasks || []).reduce((sum, t) =>
+    sum + (t.timeTotal || 0) + (t.subtasks || []).reduce((s, sub) => s + (sub.timeTotal || 0), 0), 0);
+  const projEstMins = (p.tasks || []).reduce((sum, t) => sum + (t.estimatedMinutes || 0), 0);
+  const projBilling = calcBilling(projActualSecs, p.hourlyRate);
+  const projTimeBar = projActualSecs > 0 || projEstMins > 0 || p.billable ? `
+    <div class="project-view-time">
+      ${p.billable ? `<span class="badge-billable">💰 Billable</span>` : ''}
+      <span class="time-label">סה"כ זמן:</span>
+      <span class="time-actual">⏱ ${formatTime(projActualSecs)}</span>
+      ${projEstMins > 0 ? `<span class="time-sep">/</span><span class="time-estimated">${formatEstimate(projEstMins)} מתוכנן</span>` : ''}
+      ${projBilling !== null ? `<span class="billing-amount">${formatMoney(projBilling)}</span>` : ''}
+      ${p.hourlyRate > 0 ? `<span class="time-label">(${formatMoney(p.hourlyRate)}/ש')</span>` : ''}
+    </div>` : '';
+
   const tasksHtml = filtered.length === 0
     ? `<div class="empty-state"><div class="empty-icon">✓</div><div>אין משימות מתאימות</div></div>`
     : filtered.map(t => renderTaskCard(t, c.id, p.id, {})).join('');
@@ -812,7 +1090,7 @@ function renderProjectView() {
       <div class="view-header-title">
         <span class="project-dot lg" style="background:${p.color}"></span>
         <div>
-          <div class="breadcrumb">${esc(c.name)}</div>
+          <button class="breadcrumb breadcrumb-btn" onclick="selectClient('${c.id}')">${esc(c.name)}</button>
           <h2>${esc(p.name)}</h2>
         </div>
       </div>
@@ -822,6 +1100,7 @@ function renderProjectView() {
         <button class="btn btn-primary btn-sm" onclick="showAddTaskModal('${c.id}','${p.id}')">＋ משימה חדשה</button>
       </div>
     </div>
+    ${projTimeBar}
     <div class="filter-bar">
       <span class="filter-label">פילטר:</span>
       ${renderFilterSelects(tags)}
@@ -847,7 +1126,14 @@ function renderFilterSelects(tags) {
       { value: 'medium', label: 'בינוני'       },
       { value: 'low',    label: 'נמוך'         },
     ], f.priority, "setFilter('priority',{val})") +
-    (tags.length ? renderCsel('f-tag', tagOpts, f.tag, "setFilter('tag',{val})") : '')
+    (tags.length ? renderCsel('f-tag', tagOpts, f.tag, "setFilter('tag',{val})") : '') +
+    renderCsel('f-sort', [
+      { value: 'manual',   label: 'מיון: ידני'      },
+      { value: 'priority', label: 'מיון: עדיפות'    },
+      { value: 'dueDate',  label: 'מיון: תאריך'     },
+      { value: 'title',    label: 'מיון: שם'        },
+      { value: 'time',     label: 'מיון: זמן'       },
+    ], f.sortBy || 'manual', "setFilter('sortBy',{val})")
   );
 }
 
@@ -869,7 +1155,9 @@ function renderTaskCard(task, cid, pid, opts) {
 
   const tickAttrs = isRunning ? `data-tick data-base="${task.timeTotal || 0}"` : '';
 
+  const draggable = state.filters.sortBy === 'manual';
   return `<div class="task-card ${selected ? 'selected' : ''} ${task.status === STATUS.DONE ? 'task-done' : ''}"
+      ${draggable ? `draggable="true" data-task-id="${task.id}" data-client-id="${cid}" data-project-id="${pid}"` : ''}
       onclick="selectTask('${cid}','${pid}','${task.id}')">
     <button class="status-btn status-${task.status}"
       onclick="event.stopPropagation();cycleStatus('${cid}','${pid}','${task.id}')"
@@ -892,7 +1180,10 @@ function renderTaskCard(task, cid, pid, opts) {
     </div>
     <div class="task-card-right">
       <div class="timer-wrap">
-        <span class="timer-display ${isRunning ? 'timer-running' : ''}" ${tickAttrs}>${formatTime(baseTime)}</span>
+        <div class="timer-times">
+          <span class="timer-display ${isRunning ? 'timer-running' : ''}" ${tickAttrs}>${formatTime(baseTime)}</span>
+          ${task.estimatedMinutes ? `<span class="timer-estimated">/ ${formatEstimate(task.estimatedMinutes)}</span>` : ''}
+        </div>
         <button class="timer-btn ${isRunning ? 'running' : ''}"
           onclick="event.stopPropagation();${isRunning ? 'stopTimer()' : `startTimer('${cid}','${pid}','${task.id}')`}"
           title="${isRunning ? 'עצור שעון' : 'הפעל שעון'}">${isRunning ? '⏸' : '▶'}</button>
@@ -944,9 +1235,17 @@ function buildTaskPanel(task, cid, pid) {
     </div>`;
   })() : '';
 
+  const panelClient  = getClient(cid);
+  const panelProject = getProject(cid, pid);
+
   return `<div class="panel-inner">
     <div class="panel-header">
       <button class="close-panel-btn" onclick="closeTaskPanel()">✕</button>
+      <div class="panel-breadcrumb">
+        <button class="panel-breadcrumb-btn" onclick="selectClient('${cid}');closeTaskPanel()">${esc(panelClient?.name)}</button>
+        <span class="panel-breadcrumb-sep">›</span>
+        <button class="panel-breadcrumb-btn" onclick="selectProject('${cid}','${pid}');closeTaskPanel()">${esc(panelProject?.name)}</button>
+      </div>
       <div class="panel-header-actions">
         <button class="btn btn-ghost btn-sm" onclick="showMoveTaskModal('${cid}','${pid}','${task.id}')">📦 העברה</button>
         <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteTask('${cid}','${pid}','${task.id}')">🗑️</button>
@@ -1026,9 +1325,9 @@ function buildTaskPanel(task, cid, pid) {
       <div class="panel-section">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
           <h4 style="margin:0">תתי-משימות</h4>
-          <button class="btn btn-ghost btn-sm" onclick="showAddSubtaskModal('${cid}','${pid}','${task.id}')">＋ הוסף</button>
         </div>
         <div class="subtasks-list">${subtasksHtml}</div>
+        <input class="subtask-quick-add" placeholder="＋ הוסף תת-משימה..." onkeydown="addPanelSubtask(event,'${cid}','${pid}','${task.id}')">
       </div>
 
     </div>
@@ -1039,8 +1338,13 @@ function buildTaskPanel(task, cid, pid) {
 function saveTaskField(cid, pid, tid, field, value, rerenderPanel = false) {
   updateTask(cid, pid, tid, { [field]: value });
   renderSidebar();
-  renderMain();
   if (rerenderPanel) renderTaskPanel();
+}
+
+function saveSubtaskField(cid, pid, tid, sid, field, value) {
+  if (!value.trim()) return;
+  updateSubtask(cid, pid, tid, sid, { [field]: value.trim() });
+  renderMain();
 }
 
 function removePanelTag(cid, pid, tid, tag) {
@@ -1062,6 +1366,16 @@ function addPanelTag(e, cid, pid, tid) {
   renderTaskPanel(); renderMain();
 }
 
+function addPanelSubtask(e, cid, pid, tid) {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const title = e.target.value.trim();
+  if (!title) return;
+  addSubtask(cid, pid, tid, { title });
+  e.target.value = '';
+  renderTaskPanel(); renderMain();
+}
+
 function buildSubtaskRow(sub, cid, pid, tid) {
   const at       = state.activeTimer;
   const isActive = at && at.subtaskId === sub.id;
@@ -1073,14 +1387,16 @@ function buildSubtaskRow(sub, cid, pid, tid) {
       onclick="toggleSubtaskDone('${cid}','${pid}','${tid}','${sub.id}')"
       style="width:18px;height:18px;font-size:9px">${sub.status===STATUS.DONE?'✓':''}</button>
     <div class="subtask-body">
-      <div class="subtask-title ${sub.status===STATUS.DONE?'done':''}">${esc(sub.title)}</div>
+      <input class="subtask-title-input ${sub.status===STATUS.DONE?'done':''}"
+        value="${esc(sub.title)}"
+        onblur="saveSubtaskField('${cid}','${pid}','${tid}','${sub.id}','title',this.value)"
+        onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){this.value=this.dataset.orig;this.blur();}" data-orig="${esc(sub.title)}">
       ${sub.description ? `<div class="subtask-desc">${esc(sub.description)}</div>` : ''}
     </div>
     <div class="subtask-actions">
       <span class="timer-display ${isActive?'timer-running':''}" style="font-size:11px;min-width:50px" ${tickAttrs}>${formatTime(isActive?base:base)}</span>
       <button class="timer-btn ${isActive?'running':''}" style="width:24px;height:24px;font-size:9px"
         onclick="${isActive?'stopTimer()':`startTimer('${cid}','${pid}','${tid}','${sub.id}')`}">${isActive?'⏸':'▶'}</button>
-      <button class="btn-icon" onclick="showEditSubtaskModal('${cid}','${pid}','${tid}','${sub.id}')">✏️</button>
       <button class="btn-icon danger" onclick="confirmDeleteSubtask('${cid}','${pid}','${tid}','${sub.id}')">🗑️</button>
     </div>
   </div>`;
@@ -1143,7 +1459,8 @@ function showAddClientModal() {
     `<div class="form-group"><label>שם *</label><input id="f-name" placeholder="שם הלקוח"></div>
      <div class="form-group"><label>אימייל</label><input id="f-email" type="email" placeholder="email@example.com"></div>
      <div class="form-group"><label>טלפון</label><input id="f-phone" placeholder="050-0000000"></div>
-     <div class="form-group"><label>הערות</label><textarea id="f-notes" rows="3" placeholder="הערות..."></textarea></div>`,
+     <div class="form-group"><label>הערות</label><textarea id="f-notes" rows="3" placeholder="הערות..."></textarea></div>
+     <div class="form-group"><label>תעריף שעתי ברירת מחדל (₪)</label><input id="f-rate" type="number" min="0" step="10" placeholder="0"></div>`,
     `<button class="btn btn-primary" onclick="submitAddClient()">הוסף לקוח</button>
      <button class="btn btn-ghost" onclick="closeModal()">ביטול</button>`
   );
@@ -1152,7 +1469,7 @@ function showAddClientModal() {
 function submitAddClient() {
   const name = fval('f-name');
   if (!name) { showToast('שם הלקוח חובה', 'error'); return; }
-  const c = addClient({ name, email: fval('f-email'), phone: fval('f-phone'), notes: fval('f-notes') });
+  const c = addClient({ name, email: fval('f-email'), phone: fval('f-phone'), notes: fval('f-notes'), defaultHourlyRate: parseFloat(fval('f-rate')) || 0 });
   closeModal(); selectClient(c.id);
 }
 
@@ -1162,7 +1479,8 @@ function showEditClientModal(cid) {
     `<div class="form-group"><label>שם *</label><input id="f-name" value="${esc(c.name)}"></div>
      <div class="form-group"><label>אימייל</label><input id="f-email" type="email" value="${esc(c.email||'')}"></div>
      <div class="form-group"><label>טלפון</label><input id="f-phone" value="${esc(c.phone||'')}"></div>
-     <div class="form-group"><label>הערות</label><textarea id="f-notes" rows="3">${esc(c.notes||'')}</textarea></div>`,
+     <div class="form-group"><label>הערות</label><textarea id="f-notes" rows="3">${esc(c.notes||'')}</textarea></div>
+     <div class="form-group"><label>תעריף שעתי ברירת מחדל (₪)</label><input id="f-rate" type="number" min="0" step="10" value="${c.defaultHourlyRate||0}"></div>`,
     `<button class="btn btn-primary" onclick="submitEditClient('${cid}')">שמור</button>
      <button class="btn btn-ghost" onclick="closeModal()">ביטול</button>`
   );
@@ -1171,7 +1489,7 @@ function showEditClientModal(cid) {
 function submitEditClient(cid) {
   const name = fval('f-name');
   if (!name) { showToast('שם הלקוח חובה', 'error'); return; }
-  updateClient(cid, { name, email: fval('f-email'), phone: fval('f-phone'), notes: fval('f-notes') });
+  updateClient(cid, { name, email: fval('f-email'), phone: fval('f-phone'), notes: fval('f-notes'), defaultHourlyRate: parseFloat(fval('f-rate')) || 0 });
   closeModal(); render();
 }
 
@@ -1179,7 +1497,8 @@ function submitEditClient(cid) {
 // MODAL — ADD / EDIT PROJECT
 // ============================================================
 function showAddProjectModal(cid) {
-  showModal('פרויקט חדש', buildProjectForm({}),
+  const c = getClient(cid);
+  showModal('פרויקט חדש', buildProjectForm({}, c?.defaultHourlyRate || 0),
     `<button class="btn btn-primary" onclick="submitAddProject('${cid}')">הוסף פרויקט</button>
      <button class="btn btn-ghost" onclick="closeModal()">ביטול</button>`
   );
@@ -1189,7 +1508,9 @@ function submitAddProject(cid) {
   const name = fval('f-name');
   if (!name) { showToast('שם הפרויקט חובה', 'error'); return; }
   const color = document.querySelector('input[name="pcolor"]:checked')?.value || PROJECT_COLORS[0];
-  const p = addProject(cid, { name, color });
+  const billable = document.getElementById('f-billable')?.checked || false;
+  const hourlyRate = parseFloat(fval('f-rate')) || 0;
+  const p = addProject(cid, { name, color, billable, hourlyRate });
   closeModal(); selectProject(cid, p.id);
 }
 
@@ -1205,19 +1526,32 @@ function submitEditProject(cid, pid) {
   const name = fval('f-name');
   if (!name) { showToast('שם הפרויקט חובה', 'error'); return; }
   const color = document.querySelector('input[name="pcolor"]:checked')?.value || PROJECT_COLORS[0];
-  updateProject(cid, pid, { name, color });
+  const billable = document.getElementById('f-billable')?.checked || false;
+  const hourlyRate = parseFloat(fval('f-rate')) || 0;
+  updateProject(cid, pid, { name, color, billable, hourlyRate });
   closeModal(); render();
 }
 
-function buildProjectForm(p) {
+function buildProjectForm(p, defaultHourlyRate = 0) {
   const swatches = PROJECT_COLORS.map((c, i) =>
     `<label class="color-option" title="${c}">
       <input type="radio" name="pcolor" value="${c}" ${(p.color||PROJECT_COLORS[0])===c?'checked':''}>
       <span class="color-swatch" style="background:${c};color:${c}"></span>
     </label>`
   ).join('');
+  const rate = p.hourlyRate ?? defaultHourlyRate;
   return `<div class="form-group"><label>שם *</label><input id="f-name" value="${esc(p.name||'')}" placeholder="שם הפרויקט"></div>
-    <div class="form-group"><label>צבע</label><div class="color-picker">${swatches}</div></div>`;
+    <div class="form-group"><label>צבע</label><div class="color-picker">${swatches}</div></div>
+    <div class="form-group billing-row">
+      <label class="toggle-label">
+        <input type="checkbox" id="f-billable" ${p.billable ? 'checked' : ''}>
+        <span>ניתן לחיוב (Billable)</span>
+      </label>
+    </div>
+    <div class="form-group">
+      <label>תעריף שעתי (₪)</label>
+      <input id="f-rate" type="number" min="0" step="10" value="${rate||0}" placeholder="0">
+    </div>`;
 }
 
 // ============================================================
@@ -1500,6 +1834,52 @@ document.addEventListener('keydown', (e) => {
 
 document.addEventListener('click', () => {
   document.querySelectorAll('.csel.open').forEach(c => c.classList.remove('open'));
+});
+
+// ============================================================
+// DRAG & DROP — task reordering
+// ============================================================
+let _drag = null; // { taskId, clientId, projectId }
+
+document.addEventListener('dragstart', e => {
+  const card = e.target.closest('[data-task-id]');
+  if (!card) return;
+  _drag = { taskId: card.dataset.taskId, clientId: card.dataset.clientId, projectId: card.dataset.projectId };
+  card.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+});
+
+document.addEventListener('dragend', e => {
+  document.querySelectorAll('.task-card.dragging, .task-card.drag-over-top, .task-card.drag-over-bot').forEach(el => {
+    el.classList.remove('dragging', 'drag-over-top', 'drag-over-bot');
+  });
+  _drag = null;
+});
+
+document.addEventListener('dragover', e => {
+  const card = e.target.closest('[data-task-id]');
+  if (!card || !_drag) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  const rect = card.getBoundingClientRect();
+  const insertBefore = e.clientY < rect.top + rect.height / 2;
+  card.classList.toggle('drag-over-top', insertBefore);
+  card.classList.toggle('drag-over-bot', !insertBefore);
+});
+
+document.addEventListener('dragleave', e => {
+  const card = e.target.closest('[data-task-id]');
+  if (card) card.classList.remove('drag-over-top', 'drag-over-bot');
+});
+
+document.addEventListener('drop', e => {
+  const card = e.target.closest('[data-task-id]');
+  if (!card || !_drag) return;
+  e.preventDefault();
+  const toTaskId = card.dataset.taskId;
+  const rect = card.getBoundingClientRect();
+  const insertBefore = e.clientY < rect.top + rect.height / 2;
+  reorderTask(_drag.taskId, _drag.clientId, _drag.projectId, toTaskId, insertBefore);
 });
 
 // ============================================================

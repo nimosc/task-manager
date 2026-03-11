@@ -34,7 +34,7 @@ Each task has: `id, title, description, priority (high/medium/low), tags[], dueD
 
 **Modal system** — `showModal(html, onSubmit)` renders a form into `#modal-box`. Submit handler reads form values and calls the appropriate CRUD function.
 
-**Clockify integration** — Bidirectional sync: `startTimer()` immediately opens a Clockify entry (stored as `state.activeTimer.clockifyEntryId`); `stopTimer()` closes it. If no entry was opened (or elapsed < 60s), stop falls back to posting a completed entry. Workspace ID: `6386f7b7f4b38507be1e5f5a`. User ID: `6386f7b7f4b38507be1e5f59`. Both are hardcoded constants in app.js.
+**Clockify integration** — Bidirectional sync: `startTimer()` immediately opens a Clockify entry (stored as `state.activeTimer.clockifyEntryId`); `stopTimer()` closes it. If no entry was opened (or elapsed < 60s), stop falls back to posting a completed entry. Workspace ID and User ID are hardcoded constants (`CLOCKIFY_WORKSPACE`, `CLOCKIFY_USER_ID`). The API key has a hardcoded default in `defaultState()` but is overridable via the UI and persisted in `state.clockifyApiKey`.
 
 **Move task** — `moveTask(tid, fromCid, fromPid, toCid, toPid)` relocates a task between projects and updates the active timer context if that task is running.
 
