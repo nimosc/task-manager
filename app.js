@@ -390,13 +390,20 @@ function stopTimer() {
   const secs    = elapsed(at.startTime);
   const endTime = at.startTime + secs * 1000;
 
-  // Accumulate time locally
+  // Accumulate time locally + log the entry with timestamp
+  const timeEntry = {
+    id: uuid(),
+    date:    new Date(endTime).toISOString().split('T')[0],  // YYYY-MM-DD
+    start:   at.startTime,
+    end:     endTime,
+    seconds: secs
+  };
   if (at.type === 'subtask') {
     const s = getSubtask(at.clientId, at.projectId, at.taskId, at.subtaskId);
-    if (s) s.timeTotal = (s.timeTotal || 0) + secs;
+    if (s) { s.timeTotal = (s.timeTotal || 0) + secs; (s.timeEntries = s.timeEntries || []).push(timeEntry); }
   } else {
     const t = getTask(at.clientId, at.projectId, at.taskId);
-    if (t) t.timeTotal = (t.timeTotal || 0) + secs;
+    if (t) { t.timeTotal = (t.timeTotal || 0) + secs; (t.timeEntries = t.timeEntries || []).push(timeEntry); }
   }
 
   // Stop Clockify entry
@@ -859,9 +866,15 @@ function renderReportView() {
   const monthStart = `${state.reportMonth}-01`;
   const monthEnd   = new Date(ry, rm, 0).toISOString().split('T')[0]; // last day of month
 
-  // Build month options (last 12 months)
+  // Helper: sum seconds from timeEntries within the selected month
+  function secsInMonth(entries) {
+    return (entries || []).filter(e => e.date >= monthStart && e.date <= monthEnd)
+                          .reduce((sum, e) => sum + (e.seconds || 0), 0);
+  }
+
+  // Build month options (last 24 months)
   let monthOpts = '';
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 24; i++) {
     const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i);
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -870,61 +883,57 @@ function renderReportView() {
     monthOpts += `<option value="${val}" ${val === state.reportMonth ? 'selected' : ''}>${label}</option>`;
   }
 
-  let grandTotal = 0;
-  let grandBillable = 0;
-  let grandBilling = 0;
+  let grandTotal = 0, grandBillable = 0, grandBilling = 0;
   let clientsHtml = '';
 
   for (const c of state.clients) {
-    let clientTotal = 0;
-    let clientBillable = 0;
-    let clientBilling = 0;
+    let clientTotal = 0, clientBillable = 0, clientBilling = 0;
     let projectsHtml = '';
 
     for (const p of (c.projects || [])) {
-      let projTotal = 0;
-      let projBillable = 0;
-      let projBilling = 0;
+      let projTotal = 0, projBillable = 0, projBilling = 0;
       let tasksHtml = '';
 
       for (const t of (p.tasks || [])) {
-        // Filter: task must have dueDate in selected month (or show all if no dueDate filter desired)
-        const inMonth = !t.dueDate || (t.dueDate >= monthStart && t.dueDate <= monthEnd);
-        if (!inMonth) continue;
-        const secs = t.timeTotal || 0;
-        if (secs === 0 && t.status !== STATUS.DONE) continue; // skip tasks with no time tracked
-        projTotal += secs;
-        if (p.billable) { projBillable += secs; projBilling += (secs / 3600) * (p.hourlyRate || 0); }
+        // Sum only time entries that fall within the selected month
+        const secs = secsInMonth(t.timeEntries);
+        // Also count subtask entries in this month
+        const subtaskSecs = (t.subtasks || []).reduce((sum, s) => sum + secsInMonth(s.timeEntries), 0);
+        const totalSecs = secs + subtaskSecs;
+        if (totalSecs === 0) continue;
+
+        projTotal += totalSecs;
+        if (p.billable) { projBillable += totalSecs; projBilling += (totalSecs / 3600) * (p.hourlyRate || 0); }
 
         const statusIcon = STATUS_ICONS[t.status] || '○';
-        const statusClass = t.status === STATUS.DONE ? 'done' : t.status === STATUS.IN_PROGRESS ? 'inprog' : '';
-        tasksHtml += `<tr class="report-task-row ${statusClass}">
+        const isDone = t.status === STATUS.DONE;
+        tasksHtml += `<tr class="report-task-row ${isDone ? 'done' : ''}">
           <td class="report-task-title">${esc(t.title)}</td>
-          <td class="report-task-status"><span class="badge badge-${t.status === STATUS.DONE ? 'done' : t.status === STATUS.IN_PROGRESS ? 'inprogress' : 'open'}">${statusIcon} ${STATUS_LABELS[t.status]}</span></td>
-          <td class="report-task-time">${formatTime(secs)}</td>
-          ${p.billable && p.hourlyRate ? `<td class="report-task-billing">${formatMoney((secs/3600)*p.hourlyRate)}</td>` : '<td></td>'}
+          <td class="report-task-status"><span class="badge badge-${isDone ? 'done' : t.status === STATUS.IN_PROGRESS ? 'in-progress' : 'open'}">${statusIcon} ${STATUS_LABELS[t.status]}</span></td>
+          <td class="report-task-time">${formatTime(totalSecs)}</td>
+          ${p.billable && p.hourlyRate ? `<td class="report-task-billing">${formatMoney((totalSecs/3600)*p.hourlyRate)}</td>` : '<td></td>'}
         </tr>`;
       }
 
-      if (projTotal === 0 && !tasksHtml) continue;
+      if (projTotal === 0) continue;
       clientTotal += projTotal; clientBillable += projBillable; clientBilling += projBilling;
 
       projectsHtml += `<details class="report-project" open>
         <summary class="report-project-header">
           <span class="project-dot sm" style="background:${p.color}"></span>
           <span class="report-proj-name">${esc(p.name)}</span>
-          ${p.billable ? '<span class="badge-billable">חיוני</span>' : ''}
+          ${p.billable ? '<span class="badge-billable">לחיוב</span>' : ''}
           <span class="report-time">${formatTime(projTotal)}</span>
           ${projBilling > 0 ? `<span class="report-billing">${formatMoney(projBilling)}</span>` : ''}
         </summary>
-        ${tasksHtml ? `<table class="report-tasks-table">
-          <thead><tr><th>משימה</th><th>סטטוס</th><th>זמן</th><th>חיוב</th></tr></thead>
+        <table class="report-tasks-table">
+          <thead><tr><th>משימה</th><th>סטטוס</th><th>זמן החודש</th><th>חיוב</th></tr></thead>
           <tbody>${tasksHtml}</tbody>
-        </table>` : '<div class="report-empty-proj">אין משימות עם זמן מעקב</div>'}
+        </table>
       </details>`;
     }
 
-    if (clientTotal === 0 && !projectsHtml) continue;
+    if (clientTotal === 0) continue;
     grandTotal += clientTotal; grandBillable += clientBillable; grandBilling += clientBilling;
 
     clientsHtml += `<details class="report-client-section" open>
@@ -934,11 +943,11 @@ function renderReportView() {
         <span class="report-client-time">${formatTime(clientTotal)}</span>
         ${clientBilling > 0 ? `<span class="report-client-billing">${formatMoney(clientBilling)}</span>` : ''}
       </summary>
-      <div class="report-projects-list">${projectsHtml || '<div class="report-empty-proj">אין פרויקטים עם זמן מעקב</div>'}</div>
+      <div class="report-projects-list">${projectsHtml}</div>
     </details>`;
   }
 
-  const emptyMsg = clientsHtml ? '' : `<div class="empty-state"><div class="empty-icon">📊</div><div>אין נתוני שעות לחודש זה</div></div>`;
+  const emptyMsg = clientsHtml ? '' : `<div class="empty-state"><div class="empty-icon">📊</div><div>אין רשומות זמן לחודש זה</div><div style="font-size:12px;color:var(--text-muted);margin-top:8px">רשומות נוצרות אוטומטית בכל עצירת שעון</div></div>`;
 
   return `<div class="view-container report-view">
     <div class="view-header">
@@ -948,9 +957,9 @@ function renderReportView() {
       </div>
     </div>
     <div class="report-grand-total">
-      <span>סה"כ זמן:</span>
+      <span>סה"כ זמן החודש:</span>
       <span class="report-grand-time">${formatTime(grandTotal)}</span>
-      ${grandBillable > 0 ? `<span class="report-grand-sep">|</span><span>שעות לחיוב: ${formatTime(grandBillable)}</span>` : ''}
+      ${grandBillable > 0 ? `<span class="report-grand-sep">|</span><span>לחיוב: ${formatTime(grandBillable)}</span>` : ''}
       ${grandBilling > 0 ? `<span class="report-grand-sep">|</span><span class="report-grand-billing">💰 ${formatMoney(grandBilling)}</span>` : ''}
     </div>
     ${clientsHtml}
