@@ -28,19 +28,30 @@ const PROJECT_COLORS = [
 // ============================================================
 let state = {};
 let timerInterval = null;
+let panelActiveTab = 'details'; // 'details' | 'log'
 
 function defaultState() {
   return {
     clients: [],
-    activeTimer: null,          // { type, clientId, projectId, taskId, subtaskId, startTime }
+    activeTimer: null,
     clockifyApiKey: 'ZjI3MmYxOTUtOTUxOS00MTgyLTgzNzktZDdmNjYzM2UwMmQ5',
-    currentView: 'today',       // 'today' | 'client' | 'project'
+    currentView: 'today',
     selectedClientId: null,
     selectedProjectId: null,
     selectedTaskId: null,
-    panelClientId: null,        // context for open task panel
+    panelClientId: null,
     panelProjectId: null,
-    reportMonth: null,          // 'YYYY-MM' for report view; null = current month
+    reportRange: null,
+    settingsSection: 'business',
+    business: {
+      name: '', tagline: '', email: '', phone: '',
+      address: '', taxId: '', website: '', logoUrl: ''
+    },
+    integrations: {
+      clockify:  { enabled: true,  apiKey: '', workspaceId: CLOCKIFY_WORKSPACE, userId: CLOCKIFY_USER_ID },
+      greenapi:  { enabled: false, instanceId: '', token: '' },
+      accounting:{ enabled: false, provider: '', apiKey: '' },
+    },
     filters: {
       status: STATUS.OPEN,
       priority: 'all',
@@ -56,10 +67,34 @@ function loadState() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const saved = JSON.parse(raw);
-      state = Object.assign(defaultState(), saved);
-      // If API key was never set, use the default
-      if (!state.clockifyApiKey) {
-        state.clockifyApiKey = defaultState().clockifyApiKey;
+      const def = defaultState();
+      state = Object.assign(def, saved);
+      // Deep-merge nested objects that Object.assign would overwrite entirely
+      state.business     = Object.assign(def.business,     saved.business     || {});
+      state.integrations = Object.assign(def.integrations, saved.integrations || {});
+      state.integrations.clockify   = Object.assign(def.integrations.clockify,   (saved.integrations||{}).clockify   || {});
+      state.integrations.greenapi   = Object.assign(def.integrations.greenapi,   (saved.integrations||{}).greenapi   || {});
+      state.integrations.accounting = Object.assign(def.integrations.accounting, (saved.integrations||{}).accounting || {});
+      // Migrate old top-level clockifyApiKey → integrations.clockify.apiKey
+      if (saved.clockifyApiKey && !state.integrations.clockify.apiKey) {
+        state.integrations.clockify.apiKey = saved.clockifyApiKey;
+      }
+      if (!state.clockifyApiKey) state.clockifyApiKey = def.clockifyApiKey;
+      // Migrate old reportMonth → reportRange
+      if (state.reportMonth && !state.reportRange) {
+        const [y, m] = state.reportMonth.split('-').map(Number);
+        const from = `${y}-${String(m).padStart(2,'0')}-01`;
+        const to   = new Date(y, m, 0).toISOString().split('T')[0];
+        state.reportRange = { mode: 'monthly', from, to };
+        delete state.reportMonth;
+      }
+      // Migrate stored 'in-progress' → 'open' (in-progress is now derived, not stored)
+      for (const c of (state.clients || [])) {
+        for (const p of (c.projects || [])) {
+          for (const t of (p.tasks || [])) {
+            if (t.status === STATUS.IN_PROGRESS) t.status = STATUS.OPEN;
+          }
+        }
       }
     } else {
       state = defaultState();
@@ -150,6 +185,14 @@ function esc(str) {
 // ============================================================
 // DATA HELPERS
 // ============================================================
+// Derived status: a task is 'in-progress' if it has logged time but isn't done
+function effectiveStatus(task) {
+  if (!task) return STATUS.OPEN;
+  if (task.status === STATUS.DONE) return STATUS.DONE;
+  if ((task.timeTotal || 0) > 0) return STATUS.IN_PROGRESS;
+  return STATUS.OPEN;
+}
+
 function getClient(id) { return state.clients.find(c => c.id === id); }
 function getProject(cid, pid) { return getClient(cid)?.projects?.find(p => p.id === pid); }
 function getTask(cid, pid, tid) { return getProject(cid, pid)?.tasks?.find(t => t.id === tid); }
@@ -159,12 +202,14 @@ function allTodayItems() {
   const today = todayStr();
   const result = [];
   for (const client of state.clients) {
+    if (client.archived) continue;
     for (const project of (client.projects || [])) {
+      if (project.archived) continue;
       for (const task of (project.tasks || [])) {
         if (task.status === STATUS.DONE) continue;
         const isToday      = task.dueDate === today;
         const isOverdue    = task.dueDate && task.dueDate < today;
-        const isInProgress = task.status === STATUS.IN_PROGRESS;
+        const isInProgress = effectiveStatus(task) === STATUS.IN_PROGRESS;
         if (isToday || isOverdue || isInProgress) result.push({ client, project, task });
       }
     }
@@ -257,6 +302,39 @@ function deleteProject(cid, pid) {
   saveState();
 }
 
+function archiveClient(cid) {
+  const c = getClient(cid);
+  if (!c) return;
+  c.archived = true;
+  if (state.activeTimer?.clientId === cid) cancelTimer();
+  if (state.selectedClientId === cid) {
+    state.selectedClientId = null; state.selectedProjectId = null;
+    state.selectedTaskId = null; state.currentView = 'today';
+  }
+  saveState(); render();
+}
+
+function unarchiveClient(cid) {
+  const c = getClient(cid);
+  if (c) { c.archived = false; saveState(); render(); }
+}
+
+function archiveProject(cid, pid) {
+  const p = getProject(cid, pid);
+  if (!p) return;
+  p.archived = true;
+  if (state.activeTimer?.projectId === pid) cancelTimer();
+  if (state.selectedProjectId === pid) {
+    state.selectedProjectId = null; state.selectedTaskId = null; state.currentView = 'client';
+  }
+  saveState(); render();
+}
+
+function unarchiveProject(cid, pid) {
+  const p = getProject(cid, pid);
+  if (p) { p.archived = false; saveState(); render(); }
+}
+
 // ============================================================
 // CRUD — TASKS
 // ============================================================
@@ -268,7 +346,9 @@ function addTask(cid, pid, data) {
     description: data.description || '', priority: data.priority || PRIORITY.MEDIUM,
     tags: data.tags || [], dueDate: data.dueDate || null,
     status: STATUS.OPEN, timeTotal: 0, subtasks: [],
-    estimatedMinutes: data.estimatedMinutes || null
+    estimatedMinutes: data.estimatedMinutes || null,
+    recurring: data.recurring || null   // { frequency: 'daily'|'weekly'|'monthly'|'custom', interval: N }
+
   };
   (p.tasks = p.tasks || []).push(task);
   saveState();
@@ -403,7 +483,10 @@ function stopTimer() {
     if (s) { s.timeTotal = (s.timeTotal || 0) + secs; (s.timeEntries = s.timeEntries || []).push(timeEntry); }
   } else {
     const t = getTask(at.clientId, at.projectId, at.taskId);
-    if (t) { t.timeTotal = (t.timeTotal || 0) + secs; (t.timeEntries = t.timeEntries || []).push(timeEntry); }
+    if (t) {
+      t.timeTotal = (t.timeTotal || 0) + secs;
+      (t.timeEntries = t.timeEntries || []).push(timeEntry);
+    }
   }
 
   // Stop Clockify entry
@@ -642,7 +725,11 @@ function applySortBy(tasks) {
 function applyFilters(tasks) {
   const f = state.filters;
   const filtered = tasks.filter(t => {
-    if (f.status   !== 'all' && t.status   !== f.status)   return false;
+    if (f.status !== 'all') {
+      // 'open' filter shows both open and in-progress (in-progress = timer running)
+      if (f.status === STATUS.OPEN) { if (t.status === STATUS.DONE) return false; }
+      else if (t.status !== f.status) return false;
+    }
     if (f.priority !== 'all' && t.priority !== f.priority) return false;
     if (f.tag      !== 'all' && !(t.tags || []).includes(f.tag)) return false;
     return true;
@@ -687,25 +774,30 @@ function applyTodayFilters(items) {
 // ============================================================
 // NAVIGATION
 // ============================================================
-function navigateTo(view) {
-  state.currentView = view;
+function resetViewFilters() {
+  state.filters.status = STATUS.OPEN;
   state.selectedTaskId = null; state.panelClientId = null; state.panelProjectId = null;
+}
+
+function navigateTo(view) {
+  resetViewFilters();
+  state.currentView = view;
   saveState(); render();
 }
 
 function selectClient(cid) {
+  resetViewFilters();
   if (state.selectedClientId === cid && state.currentView === 'client') {
     state.selectedClientId = null; state.currentView = 'today';
   } else {
-    state.selectedClientId = cid; state.selectedProjectId = null;
-    state.selectedTaskId = null; state.currentView = 'client';
+    state.selectedClientId = cid; state.selectedProjectId = null; state.currentView = 'client';
   }
   saveState(); render();
 }
 
 function selectProject(cid, pid) {
-  state.selectedClientId = cid; state.selectedProjectId = pid;
-  state.selectedTaskId = null; state.currentView = 'project';
+  resetViewFilters();
+  state.selectedClientId = cid; state.selectedProjectId = pid; state.currentView = 'project';
   saveState(); render();
 }
 
@@ -720,6 +812,7 @@ function selectTask(cid, pid, tid) {
 
 function closeTaskPanel() {
   state.selectedTaskId = null; state.panelClientId = null; state.panelProjectId = null;
+  panelActiveTab = 'details';
   saveState(); render();
 }
 
@@ -728,11 +821,57 @@ function setFilter(key, value) {
   saveState(); renderMain(); renderTaskPanel();
 }
 
+function nextRecurringDate(task) {
+  const r = task.recurring;
+  if (!r) return null;
+  const base = task.dueDate ? new Date(task.dueDate) : new Date();
+  const d = new Date(base);
+  if      (r.frequency === 'daily')   d.setDate(d.getDate() + 1);
+  else if (r.frequency === 'weekly')  d.setDate(d.getDate() + 7);
+  else if (r.frequency === 'monthly') d.setMonth(d.getMonth() + 1);
+  else if (r.frequency === 'custom')  d.setDate(d.getDate() + (r.interval || 1));
+  return d.toISOString().split('T')[0];
+}
+
 function cycleStatus(cid, pid, tid) {
   const t = getTask(cid, pid, tid);
   if (!t) return;
-  const cycle = [STATUS.OPEN, STATUS.IN_PROGRESS, STATUS.DONE];
-  t.status = cycle[(cycle.indexOf(t.status) + 1) % cycle.length];
+  // Circle is binary: open/in-progress → done, done → open
+  const newStatus = t.status === STATUS.DONE ? STATUS.OPEN : STATUS.DONE;
+  t.status = newStatus;
+
+  // Stop timer automatically if this task (or its subtask) is running
+  if (newStatus === STATUS.DONE && state.activeTimer?.taskId === tid) {
+    stopTimer();
+  }
+
+  // Log the status change + track completedAt
+  const now = Date.now();
+  if (newStatus === STATUS.DONE) {
+    t.completedAt = now;
+  } else {
+    t.completedAt = null;
+  }
+  (t.activityLog = t.activityLog || []).push({
+    type: newStatus === STATUS.DONE ? 'done' : 'reopened',
+    timestamp: now
+  });
+
+  // When a recurring task is completed, spawn the next occurrence
+  if (newStatus === STATUS.DONE && t.recurring) {
+    const nextDue = nextRecurringDate(t);
+    const p = getProject(cid, pid);
+    if (p && nextDue) {
+      const nextTask = addTask(cid, pid, {
+        title: t.title, description: t.description,
+        priority: t.priority, tags: [...(t.tags || [])],
+        dueDate: nextDue, estimatedMinutes: t.estimatedMinutes,
+        recurring: { ...t.recurring }
+      });
+      showToast(`🔁 משימה חוזרת — נוצרה משימה חדשה לתאריך ${formatDisplayDate(nextDue)}`, 'info');
+    }
+  }
+
   saveState(); render();
 }
 
@@ -771,6 +910,7 @@ function renderSidebar() {
     </div>`;
 
   for (const c of state.clients) {
+    if (c.archived) continue;
     const active = state.selectedClientId === c.id;
     html += `<div class="nav-client ${active ? 'active' : ''}">
       <div class="nav-client-header" onclick="selectClient('${c.id}')">
@@ -781,12 +921,22 @@ function renderSidebar() {
       ${renderSidebarProjects(c)}
     </div>`;
   }
+
+  const hasArchived = state.clients.some(c => c.archived || (c.projects||[]).some(p => p.archived));
+  const isArchive = state.currentView === 'archive';
+  if (hasArchived) {
+    html += `<div class="nav-today ${isArchive ? 'active' : ''}" onclick="navigateTo('archive')" style="margin-top:8px;opacity:0.7">
+      <span class="nav-today-icon">📦</span>
+      <span>ארכיון</span>
+    </div>`;
+  }
   nav.innerHTML = html;
 }
 
 function renderSidebarProjects(client) {
   let html = '<div class="nav-projects">';
   for (const p of (client.projects || [])) {
+    if (p.archived) continue;
     const active = state.selectedProjectId === p.id;
     html += `<div class="nav-project ${active ? 'active' : ''}" onclick="selectProject('${client.id}','${p.id}')">
       <span class="project-dot sm" style="background:${p.color}"></span>
@@ -806,7 +956,9 @@ function renderMain() {
     case 'client':  el.innerHTML = renderClientView();  break;
     case 'project': el.innerHTML = renderProjectView(); break;
     case 'report':  el.innerHTML = renderReportView();  break;
-    default:        el.innerHTML = renderTodayView();
+    case 'archive':   el.innerHTML = renderArchiveView();   break;
+    case 'settings':  el.innerHTML = renderSettingsView();  break;
+    default:          el.innerHTML = renderTodayView();
   }
 }
 
@@ -831,7 +983,7 @@ function renderTodayView() {
 
   const clientOpts = [
     { value: 'all', label: 'כל הלקוחות' },
-    ...state.clients.map(c => ({ value: c.id, label: c.name }))
+    ...state.clients.filter(c => !c.archived).map(c => ({ value: c.id, label: c.name }))
   ];
 
   return `<div class="view-container">
@@ -856,60 +1008,123 @@ function renderTodayView() {
 // ============================================================
 // REPORT VIEW
 // ============================================================
-function renderReportView() {
-  // Month/year selector stored in state
-  if (!state.reportMonth) {
-    const now = new Date();
-    state.reportMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-  }
-  const [ry, rm] = state.reportMonth.split('-').map(Number);
-  const monthStart = `${state.reportMonth}-01`;
-  const monthEnd   = new Date(ry, rm, 0).toISOString().split('T')[0]; // last day of month
+function getDefaultReportRange() {
+  const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth();
+  const from = `${y}-${String(m + 1).padStart(2, '0')}-01`;
+  const to   = new Date(y, m + 1, 0).toISOString().split('T')[0];
+  return { mode: 'monthly', from, to };
+}
 
-  // Helper: sum seconds from timeEntries within the selected month
-  function secsInMonth(entries) {
-    return (entries || []).filter(e => e.date >= monthStart && e.date <= monthEnd)
+function renderReportView() {
+  if (!state.reportRange) state.reportRange = getDefaultReportRange();
+  const rr = state.reportRange;
+  const { mode, from, to } = rr;
+
+  // Helper: sum seconds from timeEntries within the selected range
+  function secsInRange(entries) {
+    return (entries || []).filter(e => e.date >= from && e.date <= to)
                           .reduce((sum, e) => sum + (e.seconds || 0), 0);
   }
 
-  // Build month options (last 24 months)
-  let monthOpts = '';
-  for (let i = 0; i < 24; i++) {
-    const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i);
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const val = `${y}-${m}`;
-    const label = d.toLocaleDateString('he-IL', { year: 'numeric', month: 'long' });
-    monthOpts += `<option value="${val}" ${val === state.reportMonth ? 'selected' : ''}>${label}</option>`;
+  // --- Date navigation helpers ---
+  function fmtDate(d) { return d.toISOString().split('T')[0]; }
+  function parseDate(s) { const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); }
+
+  // --- UI: mode tabs ---
+  const modes = [
+    { key: 'daily',   label: 'יומי' },
+    { key: 'weekly',  label: 'שבועי' },
+    { key: 'monthly', label: 'חודשי' },
+    { key: 'custom',  label: 'טווח חופשי' },
+  ];
+  const modeTabs = modes.map(({ key, label }) =>
+    `<button class="report-mode-tab ${mode === key ? 'active' : ''}" onclick="setReportMode('${key}')">${label}</button>`
+  ).join('');
+
+  // --- UI: range selector per mode ---
+  let rangeSelector = '';
+  if (mode === 'daily') {
+    const prev = fmtDate(new Date(parseDate(from).getTime() - 86400000));
+    const next = fmtDate(new Date(parseDate(from).getTime() + 86400000));
+    const label = parseDate(from).toLocaleDateString('he-IL', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    rangeSelector = `<div class="report-range-nav">
+      <button class="report-nav-btn" onclick="setReportDaily('${prev}')">&#x276F;</button>
+      <span class="report-range-label">${label}</span>
+      <button class="report-nav-btn" onclick="setReportDaily('${next}')">&#x276E;</button>
+      <input type="date" class="report-date-input" value="${from}" onchange="setReportDaily(this.value)">
+    </div>`;
+  } else if (mode === 'weekly') {
+    // week: Mon-Sun
+    const fromD = parseDate(from);
+    const toD   = parseDate(to);
+    const prevFrom = fmtDate(new Date(fromD.getTime() - 7 * 86400000));
+    const nextFrom = fmtDate(new Date(fromD.getTime() + 7 * 86400000));
+    const fmtShort = d => d.toLocaleDateString('he-IL', { day: 'numeric', month: 'numeric' });
+    rangeSelector = `<div class="report-range-nav">
+      <button class="report-nav-btn" onclick="setReportWeek('${prevFrom}')">&#x276F;</button>
+      <span class="report-range-label">${fmtShort(fromD)} – ${fmtShort(toD)}</span>
+      <button class="report-nav-btn" onclick="setReportWeek('${nextFrom}')">&#x276E;</button>
+    </div>`;
+  } else if (mode === 'monthly') {
+    const [ry, rm] = from.split('-').map(Number);
+    const prevD = new Date(ry, rm - 2, 1);
+    const nextD = new Date(ry, rm, 1);
+    const prevVal = fmtDate(prevD);
+    const nextVal = fmtDate(nextD);
+    const label = parseDate(from).toLocaleDateString('he-IL', { year: 'numeric', month: 'long' });
+    // Build last 36 month options
+    let monthOpts = '';
+    for (let i = 0; i < 36; i++) {
+      const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i);
+      const val = fmtDate(d).substring(0, 7) + '-01';
+      const lbl = d.toLocaleDateString('he-IL', { year: 'numeric', month: 'long' });
+      const curVal = `${from.substring(0,7)}-01`;
+      monthOpts += `<option value="${fmtDate(d).substring(0,8)}01" ${fmtDate(d).substring(0,7) === from.substring(0,7) ? 'selected' : ''}>${lbl}</option>`;
+    }
+    rangeSelector = `<div class="report-range-nav">
+      <button class="report-nav-btn" onclick="setReportMonthNav('${prevVal}')">&#x276F;</button>
+      <select class="report-month-select" onchange="setReportMonthNav(this.value)">${monthOpts}</select>
+      <button class="report-nav-btn" onclick="setReportMonthNav('${nextVal}')">&#x276E;</button>
+    </div>`;
+  } else if (mode === 'custom') {
+    rangeSelector = `<div class="report-range-nav">
+      <label class="report-custom-label">מ:</label>
+      <input type="date" class="report-date-input" value="${from}" onchange="setReportCustom(this.value, '${to}')">
+      <label class="report-custom-label">עד:</label>
+      <input type="date" class="report-date-input" value="${to}" onchange="setReportCustom('${from}', this.value)">
+    </div>`;
   }
 
+  // --- Build data ---
   let grandTotal = 0, grandBillable = 0, grandBilling = 0;
   let clientsHtml = '';
 
   for (const c of state.clients) {
+    if (c.archived) continue;
     let clientTotal = 0, clientBillable = 0, clientBilling = 0;
     let projectsHtml = '';
 
     for (const p of (c.projects || [])) {
+      if (p.archived) continue;
       let projTotal = 0, projBillable = 0, projBilling = 0;
       let tasksHtml = '';
 
       for (const t of (p.tasks || [])) {
-        // Sum only time entries that fall within the selected month
-        const secs = secsInMonth(t.timeEntries);
-        // Also count subtask entries in this month
-        const subtaskSecs = (t.subtasks || []).reduce((sum, s) => sum + secsInMonth(s.timeEntries), 0);
+        const secs = secsInRange(t.timeEntries);
+        const subtaskSecs = (t.subtasks || []).reduce((sum, s) => sum + secsInRange(s.timeEntries), 0);
         const totalSecs = secs + subtaskSecs;
         if (totalSecs === 0) continue;
 
         projTotal += totalSecs;
         if (p.billable) { projBillable += totalSecs; projBilling += (totalSecs / 3600) * (p.hourlyRate || 0); }
 
-        const statusIcon = STATUS_ICONS[t.status] || '○';
-        const isDone = t.status === STATUS.DONE;
+        const effSt = effectiveStatus(t);
+        const statusIcon = STATUS_ICONS[effSt] || '○';
+        const isDone = effSt === STATUS.DONE;
         tasksHtml += `<tr class="report-task-row ${isDone ? 'done' : ''}">
           <td class="report-task-title">${esc(t.title)}</td>
-          <td class="report-task-status"><span class="badge badge-${isDone ? 'done' : t.status === STATUS.IN_PROGRESS ? 'in-progress' : 'open'}">${statusIcon} ${STATUS_LABELS[t.status]}</span></td>
+          <td class="report-task-status"><span class="badge badge-${effSt}">${statusIcon} ${STATUS_LABELS[effSt]}</span></td>
           <td class="report-task-time">${formatTime(totalSecs)}</td>
           ${p.billable && p.hourlyRate ? `<td class="report-task-billing">${formatMoney((totalSecs/3600)*p.hourlyRate)}</td>` : '<td></td>'}
         </tr>`;
@@ -927,7 +1142,7 @@ function renderReportView() {
           ${projBilling > 0 ? `<span class="report-billing">${formatMoney(projBilling)}</span>` : ''}
         </summary>
         <table class="report-tasks-table">
-          <thead><tr><th>משימה</th><th>סטטוס</th><th>זמן החודש</th><th>חיוב</th></tr></thead>
+          <thead><tr><th>משימה</th><th>סטטוס</th><th>זמן</th><th>חיוב</th></tr></thead>
           <tbody>${tasksHtml}</tbody>
         </table>
       </details>`;
@@ -947,17 +1162,21 @@ function renderReportView() {
     </details>`;
   }
 
-  const emptyMsg = clientsHtml ? '' : `<div class="empty-state"><div class="empty-icon">📊</div><div>אין רשומות זמן לחודש זה</div><div style="font-size:12px;color:var(--text-muted);margin-top:8px">רשומות נוצרות אוטומטית בכל עצירת שעון</div></div>`;
+  const emptyMsg = clientsHtml ? '' : `<div class="empty-state"><div class="empty-icon">📊</div><div>אין רשומות זמן לטווח זה</div><div style="font-size:12px;color:var(--text-muted);margin-top:8px">רשומות נוצרות אוטומטית בכל עצירת שעון</div></div>`;
 
   return `<div class="view-container report-view">
     <div class="view-header">
       <div class="view-header-title"><h2>📊 דוח שעות</h2></div>
       <div class="view-actions">
-        <select class="report-month-select" onchange="setReportMonth(this.value)">${monthOpts}</select>
+        <button class="btn btn-secondary" onclick="downloadReportPDF()" title="הורד PDF">⬇ PDF</button>
       </div>
     </div>
+    <div class="report-controls">
+      <div class="report-mode-tabs">${modeTabs}</div>
+      ${rangeSelector}
+    </div>
     <div class="report-grand-total">
-      <span>סה"כ זמן החודש:</span>
+      <span>סה"כ:</span>
       <span class="report-grand-time">${formatTime(grandTotal)}</span>
       ${grandBillable > 0 ? `<span class="report-grand-sep">|</span><span>לחיוב: ${formatTime(grandBillable)}</span>` : ''}
       ${grandBilling > 0 ? `<span class="report-grand-sep">|</span><span class="report-grand-billing">💰 ${formatMoney(grandBilling)}</span>` : ''}
@@ -967,10 +1186,338 @@ function renderReportView() {
   </div>`;
 }
 
-function setReportMonth(val) {
-  state.reportMonth = val;
+function setReportMode(mode) {
+  const now = new Date();
+  function fmtDate(d) { return d.toISOString().split('T')[0]; }
+  let from, to;
+  if (mode === 'daily') {
+    from = to = fmtDate(now);
+  } else if (mode === 'weekly') {
+    const day = now.getDay(); // 0=Sun
+    const mon = new Date(now); mon.setDate(now.getDate() - ((day + 6) % 7));
+    const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+    from = fmtDate(mon); to = fmtDate(sun);
+  } else if (mode === 'monthly') {
+    const y = now.getFullYear(), m = now.getMonth();
+    from = `${y}-${String(m+1).padStart(2,'0')}-01`;
+    to   = fmtDate(new Date(y, m+1, 0));
+  } else {
+    // custom — keep previous range or default to current month
+    const prev = state.reportRange || getDefaultReportRange();
+    from = prev.from; to = prev.to;
+  }
+  state.reportRange = { mode, from, to };
   saveState();
   renderMain();
+}
+
+function setReportDaily(dateStr) {
+  state.reportRange = { mode: 'daily', from: dateStr, to: dateStr };
+  saveState(); renderMain();
+}
+
+function setReportWeek(fromStr) {
+  function fmtDate(d) { return d.toISOString().split('T')[0]; }
+  const [y, m, d] = fromStr.split('-').map(Number);
+  const start = new Date(y, m - 1, d);
+  const end   = new Date(y, m - 1, d + 6);
+  state.reportRange = { mode: 'weekly', from: fmtDate(start), to: fmtDate(end) };
+  saveState(); renderMain();
+}
+
+function setReportMonthNav(firstDayStr) {
+  function fmtDate(d) { return d.toISOString().split('T')[0]; }
+  const [y, m] = firstDayStr.split('-').map(Number);
+  const from = `${y}-${String(m).padStart(2,'0')}-01`;
+  const to   = fmtDate(new Date(y, m, 0));
+  state.reportRange = { mode: 'monthly', from, to };
+  saveState(); renderMain();
+}
+
+function setReportCustom(from, to) {
+  if (from > to) to = from;
+  state.reportRange = { mode: 'custom', from, to };
+  saveState(); renderMain();
+}
+
+function downloadReportPDF() {
+  const rr = state.reportRange || getDefaultReportRange();
+  const { from, to } = rr;
+
+  function secsInRange(entries) {
+    return (entries || []).filter(e => e.date >= from && e.date <= to)
+                          .reduce((sum, e) => sum + (e.seconds || 0), 0);
+  }
+
+  function fmtDate(iso) {
+    const [y, m, d] = iso.split('-');
+    return `${d}/${m}/${y}`;
+  }
+
+  const rangeLabel = from === to ? fmtDate(from) : `${fmtDate(from)} – ${fmtDate(to)}`;
+  const generatedAt = new Date().toLocaleDateString('he-IL', { year: 'numeric', month: 'long', day: 'numeric' });
+
+  // Build per-client HTML sections
+  let grandTotal = 0, grandBillable = 0, grandBilling = 0;
+  let clientSections = '';
+
+  for (const c of state.clients) {
+    if (c.archived) continue;
+    let clientTotal = 0, clientBillable = 0, clientBilling = 0;
+    let projectRows = '';
+    let anyTasks = false;
+
+    for (const p of (c.projects || [])) {
+      if (p.archived) continue;
+      let projTotal = 0, projBillable = 0, projBilling = 0;
+      let taskRows = '';
+
+      for (const t of (p.tasks || [])) {
+        const secs = secsInRange(t.timeEntries);
+        const subtaskSecs = (t.subtasks || []).reduce((sum, s) => sum + secsInRange(s.timeEntries), 0);
+        const totalSecs = secs + subtaskSecs;
+        if (totalSecs === 0) continue;
+
+        projTotal += totalSecs;
+        const billing = p.billable && p.hourlyRate ? (totalSecs / 3600) * p.hourlyRate : 0;
+        if (p.billable) { projBillable += totalSecs; projBilling += billing; }
+
+        const statusMap = { open: 'פתוח', 'in-progress': 'בביצוע', done: 'הושלם' };
+        taskRows += `<tr>
+          <td class="task-name">${esc(t.title)}</td>
+          <td class="task-status">${statusMap[effectiveStatus(t)] || t.status}</td>
+          <td class="task-time">${formatTime(totalSecs)}</td>
+          <td class="task-billing">${billing > 0 ? formatMoney(billing) : ''}</td>
+        </tr>`;
+        anyTasks = true;
+      }
+
+      if (projTotal === 0) continue;
+      clientTotal += projTotal; clientBillable += projBillable; clientBilling += projBilling;
+
+      projectRows += `<div class="project-block">
+        <div class="project-header">
+          <span class="project-dot" style="background:${p.color}"></span>
+          <span class="project-name">${esc(p.name)}</span>
+          ${p.billable ? '<span class="badge-bill">לחיוב</span>' : ''}
+          <span class="project-time">${formatTime(projTotal)}</span>
+          ${projBilling > 0 ? `<span class="project-billing">${formatMoney(projBilling)}</span>` : ''}
+        </div>
+        <table class="task-table">
+          <thead><tr><th>משימה</th><th>סטטוס</th><th>זמן</th><th>חיוב</th></tr></thead>
+          <tbody>${taskRows}</tbody>
+        </table>
+      </div>`;
+    }
+
+    if (clientTotal === 0) continue;
+    grandTotal += clientTotal; grandBillable += clientBillable; grandBilling += clientBilling;
+
+    const initial = (c.name || '?').charAt(0).toUpperCase();
+    clientSections += `<div class="client-section">
+      <div class="client-header">
+        <div class="client-avatar">${esc(initial)}</div>
+        <div class="client-info">
+          <div class="client-name">${esc(c.name)}</div>
+          ${c.email ? `<div class="client-contact">${esc(c.email)}</div>` : ''}
+        </div>
+        <div class="client-totals">
+          <div class="client-time">${formatTime(clientTotal)}</div>
+          ${clientBilling > 0 ? `<div class="client-billing">${formatMoney(clientBilling)}</div>` : ''}
+        </div>
+      </div>
+      ${projectRows}
+    </div>`;
+  }
+
+  const noData = !clientSections
+    ? '<div class="no-data">אין רשומות זמן לתקופה זו</div>'
+    : '';
+
+  const html = `<!DOCTYPE html>
+<html dir="rtl" lang="he">
+<head>
+  <meta charset="UTF-8">
+  <title>דוח שעות – ${rangeLabel}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      direction: rtl; font-size: 12px;
+      color: #1e1e2e; background: #fff;
+      padding: 32px 40px;
+    }
+    /* ---- Page header ---- */
+    .report-header {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      border-bottom: 3px solid #4f46e5; padding-bottom: 16px; margin-bottom: 24px;
+    }
+    .report-title { font-size: 22px; font-weight: 700; color: #4f46e5; }
+    .report-subtitle { font-size: 13px; color: #6b7280; margin-top: 4px; }
+    .report-meta { text-align: left; font-size: 11px; color: #9ca3af; line-height: 1.8; }
+    /* ---- Grand total bar ---- */
+    .grand-total {
+      background: #eef2ff; border-radius: 10px;
+      padding: 12px 18px; margin-bottom: 24px;
+      display: flex; gap: 24px; align-items: center; flex-wrap: wrap;
+    }
+    .grand-total-label { font-size: 13px; color: #4b5563; font-weight: 500; }
+    .grand-total-time  { font-size: 20px; font-weight: 800; color: #4f46e5; }
+    .grand-total-billing { font-size: 15px; font-weight: 700; color: #059669; }
+    .grand-sep { color: #c7d2fe; font-size: 20px; }
+    /* ---- Client section ---- */
+    .client-section {
+      border: 1px solid #e5e7eb; border-radius: 12px;
+      margin-bottom: 24px; overflow: hidden; page-break-inside: avoid;
+    }
+    .client-header {
+      display: flex; align-items: center; gap: 14px;
+      background: #f8fafc; padding: 14px 18px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .client-avatar {
+      width: 38px; height: 38px; border-radius: 50%;
+      background: #4f46e5; color: #fff;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px; font-weight: 700; flex-shrink: 0;
+    }
+    .client-info { flex: 1; }
+    .client-name { font-size: 16px; font-weight: 700; color: #111827; }
+    .client-contact { font-size: 11px; color: #9ca3af; margin-top: 2px; }
+    .client-totals { text-align: left; }
+    .client-time { font-size: 17px; font-weight: 800; color: #4f46e5; }
+    .client-billing { font-size: 13px; font-weight: 600; color: #059669; margin-top: 2px; }
+    /* ---- Project block ---- */
+    .project-block { margin: 0; }
+    .project-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 18px; background: #fff;
+      border-bottom: 1px solid #f3f4f6; font-size: 13px;
+    }
+    .project-dot {
+      width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+    }
+    .project-name { flex: 1; font-weight: 600; color: #374151; }
+    .project-time { font-weight: 700; color: #4f46e5; }
+    .project-billing { font-weight: 600; color: #059669; font-size: 12px; margin-right: 8px; }
+    .badge-bill {
+      font-size: 10px; padding: 1px 6px;
+      background: #d1fae5; color: #065f46; border-radius: 10px;
+    }
+    /* ---- Task table ---- */
+    .task-table {
+      width: 100%; border-collapse: collapse;
+      font-size: 11px;
+    }
+    .task-table thead tr { background: #f9fafb; }
+    .task-table th {
+      padding: 6px 18px; text-align: right;
+      color: #6b7280; font-weight: 600;
+      border-bottom: 1px solid #e5e7eb;
+    }
+    .task-table td {
+      padding: 7px 18px;
+      border-bottom: 1px solid #f3f4f6;
+      color: #374151;
+    }
+    .task-table tr:last-child td { border-bottom: none; }
+    .task-time, .task-billing { text-align: left; font-weight: 600; }
+    .task-status { color: #9ca3af; }
+    /* ---- Footer ---- */
+    .report-footer {
+      margin-top: 32px; padding-top: 12px;
+      border-top: 1px solid #e5e7eb;
+      font-size: 10px; color: #9ca3af; text-align: center;
+    }
+    .no-data { text-align: center; padding: 40px; color: #9ca3af; font-size: 14px; }
+    @media print {
+      body { padding: 16px 20px; }
+      .client-section { page-break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="report-header">
+    <div>
+      <div class="report-title">📊 דוח שעות</div>
+      <div class="report-subtitle">${rangeLabel}</div>
+    </div>
+    <div class="report-meta">
+      <div>נוצר: ${generatedAt}</div>
+    </div>
+  </div>
+
+  ${grandTotal > 0 ? `
+  <div class="grand-total">
+    <span class="grand-total-label">סה"כ לתקופה:</span>
+    <span class="grand-total-time">${formatTime(grandTotal)}</span>
+    ${grandBillable > 0 ? `<span class="grand-sep">|</span><span class="grand-total-label">לחיוב: <strong>${formatTime(grandBillable)}</strong></span>` : ''}
+    ${grandBilling > 0 ? `<span class="grand-sep">|</span><span class="grand-total-billing">💰 ${formatMoney(grandBilling)}</span>` : ''}
+  </div>` : ''}
+
+  ${clientSections}
+  ${noData}
+
+  <div class="report-footer">מנהל המשימות &nbsp;|&nbsp; ${generatedAt}</div>
+</body>
+</html>`;
+
+  const win = window.open('', '_blank');
+  win.document.write(html);
+  win.document.close();
+  // Auto-trigger print after fonts load
+  win.onload = () => { win.focus(); win.print(); };
+}
+
+function renderArchiveView() {
+  const archivedClients  = state.clients.filter(c => c.archived);
+  const clientsWithArchivedProjects = state.clients.filter(c => !c.archived && (c.projects||[]).some(p => p.archived));
+
+  let html = '';
+
+  if (archivedClients.length) {
+    html += `<h3 class="archive-section-title">לקוחות בארכיון</h3>`;
+    for (const c of archivedClients) {
+      const initial = (c.name||'?').charAt(0).toUpperCase();
+      const projCount = (c.projects||[]).length;
+      const taskCount = (c.projects||[]).reduce((s,p) => s + (p.tasks||[]).length, 0);
+      html += `<div class="archive-client-row">
+        <div class="archive-client-info">
+          <div class="client-avatar sm">${esc(initial)}</div>
+          <div>
+            <div class="archive-client-name">${esc(c.name)}</div>
+            <div class="archive-client-meta">${projCount} פרויקטים · ${taskCount} משימות</div>
+          </div>
+        </div>
+        <div class="archive-actions">
+          <button class="btn btn-ghost btn-sm" onclick="unarchiveClient('${c.id}')">↩️ שחזר</button>
+          <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteClient('${c.id}')">🗑️</button>
+        </div>
+      </div>`;
+    }
+  }
+
+  if (clientsWithArchivedProjects.length) {
+    html += `<h3 class="archive-section-title" style="margin-top:24px">פרויקטים בארכיון</h3>`;
+    for (const c of clientsWithArchivedProjects) {
+      const archivedProjs = (c.projects||[]).filter(p => p.archived);
+      html += `<div class="archive-client-group">
+        <div class="archive-group-label">👤 ${esc(c.name)}</div>
+        <div class="projects-grid">${archivedProjs.map(p => renderProjectCard(c.id, p, true)).join('')}</div>
+      </div>`;
+    }
+  }
+
+  if (!html) {
+    html = `<div class="empty-state"><div class="empty-icon">📦</div><div>הארכיון ריק</div></div>`;
+  }
+
+  return `<div class="view-container">
+    <div class="view-header">
+      <div class="view-header-title"><h2>📦 ארכיון</h2></div>
+    </div>
+    ${html}
+  </div>`;
 }
 
 function renderClientView() {
@@ -983,7 +1530,8 @@ function renderClientView() {
     c.phone ? `<div class="client-detail">📞 ${esc(c.phone)}</div>` : ''
   ].join('');
 
-  const projCards = (c.projects || []).map(p => renderProjectCard(c.id, p)).join('');
+  const projCards = (c.projects || []).filter(p => !p.archived).map(p => renderProjectCard(c.id, p)).join('');
+  const archivedProjCards = (c.projects || []).filter(p => p.archived).map(p => renderProjectCard(c.id, p, true)).join('');
 
   const clientActualSecs = (c.projects || []).reduce((sum, p) =>
     sum + (p.tasks || []).reduce((s, t) =>
@@ -1011,6 +1559,7 @@ function renderClientView() {
       <h2>👤 ${esc(c.name)}</h2>
       <div class="view-actions">
         <button class="btn btn-ghost btn-sm" onclick="showEditClientModal('${c.id}')">✏️ עריכה</button>
+        <button class="btn btn-ghost btn-sm" onclick="archiveClient('${c.id}')" title="העבר לארכיון">📦 ארכיון</button>
         <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteClient('${c.id}')">🗑️ מחיקה</button>
       </div>
     </div>
@@ -1024,18 +1573,25 @@ function renderClientView() {
       </div>
     </div>
     <div class="section-header">
-      <h3>פרויקטים (${(c.projects||[]).length})</h3>
+      <h3>פרויקטים (${(c.projects||[]).filter(p=>!p.archived).length})</h3>
       <button class="btn btn-primary btn-sm" onclick="showAddProjectModal('${c.id}')">＋ פרויקט חדש</button>
     </div>
     <div class="projects-grid">
       ${projCards || '<div class="empty-state sm">אין פרויקטים עדיין</div>'}
     </div>
+    ${archivedProjCards ? `<details class="archived-section">
+      <summary class="archived-section-header">📦 פרויקטים בארכיון (${(c.projects||[]).filter(p=>p.archived).length})</summary>
+      <div class="projects-grid">${archivedProjCards}</div>
+    </details>` : ''}
   </div>`;
 }
 
-function renderProjectCard(cid, p) {
-  const total = (p.tasks || []).length;
-  const open  = (p.tasks || []).filter(t => t.status !== STATUS.DONE).length;
+function renderProjectCard(cid, p, isArchivedView = false) {
+  const tasks      = p.tasks || [];
+  const total      = tasks.length;
+  const done       = tasks.filter(t => effectiveStatus(t) === STATUS.DONE).length;
+  const inProgress = tasks.filter(t => effectiveStatus(t) === STATUS.IN_PROGRESS).length;
+  const open       = tasks.filter(t => effectiveStatus(t) === STATUS.OPEN).length;
   const client = getClient(cid);
   const isInbox = client?._inbox;
   const actualSecs = (p.tasks || []).reduce((sum, t) =>
@@ -1049,18 +1605,29 @@ function renderProjectCard(cid, p) {
         ${estimatedMins > 0 ? `<span class="time-sep">/</span><span class="time-estimated">${formatEstimate(estimatedMins)} מתוכנן</span>` : ''}
         ${billing !== null ? `<span class="billing-amount">${formatMoney(billing)}</span>` : ''}
        </div>` : '';
-  return `<div class="project-card ${isInbox ? 'project-card-inbox' : ''}" onclick="selectProject('${cid}','${p.id}')">
+  return `<div class="project-card ${isInbox ? 'project-card-inbox' : ''} ${isArchivedView ? 'project-card-archived' : ''}" onclick="${isArchivedView ? '' : `selectProject('${cid}','${p.id}')`}">
     <div class="project-card-header">
       <span class="project-dot lg" style="background:${p.color}"></span>
       <span class="project-card-name">${esc(p.name)}</span>
       ${isInbox ? '<span class="inbox-badge">ללא לקוח</span>' : ''}
+      ${isArchivedView ? '<span class="archive-badge">📦 ארכיון</span>' : ''}
     </div>
-    <div class="project-card-stats">${open} פתוחות / ${total} סה"כ</div>
+    <div class="project-card-stats">
+      ${open > 0 ? `<span class="stat-open">${open} פתוחות</span>` : ''}
+      ${inProgress > 0 ? `<span class="stat-inprogress">${inProgress} בביצוע</span>` : ''}
+      ${done > 0 ? `<span class="stat-done">${done} הושלמו</span>` : ''}
+      ${total === 0 ? `<span class="stat-empty">אין משימות</span>` : `<span class="stat-total">סה"כ ${total}</span>`}
+    </div>
     ${timeStats}
     <div class="project-card-actions" onclick="event.stopPropagation()">
-      ${isInbox ? `<button class="btn-icon" onclick="showAssignClientModal('${cid}','${p.id}')" title="שייך ללקוח">🔗</button>` : ''}
-      <button class="btn-icon" onclick="showEditProjectModal('${cid}','${p.id}')" title="עריכה">✏️</button>
-      <button class="btn-icon danger" onclick="confirmDeleteProject('${cid}','${p.id}')" title="מחיקה">🗑️</button>
+      ${isArchivedView
+        ? `<button class="btn-icon" onclick="unarchiveProject('${cid}','${p.id}')" title="שחזר">↩️ שחזר</button>
+           <button class="btn-icon danger" onclick="confirmDeleteProject('${cid}','${p.id}')" title="מחיקה">🗑️</button>`
+        : `${isInbox ? `<button class="btn-icon" onclick="showAssignClientModal('${cid}','${p.id}')" title="שייך ללקוח">🔗</button>` : ''}
+           <button class="btn-icon" onclick="showEditProjectModal('${cid}','${p.id}')" title="עריכה">✏️</button>
+           <button class="btn-icon" onclick="archiveProject('${cid}','${p.id}')" title="ארכיון">📦</button>
+           <button class="btn-icon danger" onclick="confirmDeleteProject('${cid}','${p.id}')" title="מחיקה">🗑️</button>`
+      }
     </div>
   </div>`;
 }
@@ -1105,6 +1672,7 @@ function renderProjectView() {
       </div>
       <div class="view-actions">
         <button class="btn btn-ghost btn-sm" onclick="showEditProjectModal('${c.id}','${p.id}')">✏️</button>
+        <button class="btn btn-ghost btn-sm" onclick="archiveProject('${c.id}','${p.id}')" title="העבר לארכיון">📦</button>
         <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteProject('${c.id}','${p.id}')">🗑️</button>
         <button class="btn btn-primary btn-sm" onclick="showAddTaskModal('${c.id}','${p.id}')">＋ משימה חדשה</button>
       </div>
@@ -1124,10 +1692,9 @@ function renderFilterSelects(tags) {
   const tagOpts = [{ value: 'all', label: 'כל התגיות' }, ...tags.map(t => ({ value: t, label: t }))];
   return (
     renderCsel('f-status', [
-      { value: 'all',         label: 'כל הסטטוסים' },
-      { value: 'open',        label: 'פתוח'         },
-      { value: 'in-progress', label: 'בביצוע'       },
-      { value: 'done',        label: 'הושלם'        },
+      { value: 'all',  label: 'כל הסטטוסים' },
+      { value: 'open', label: 'פתוח / בביצוע' },
+      { value: 'done', label: 'הושלם'         },
     ], f.status, "setFilter('status',{val})") +
     renderCsel('f-priority', [
       { value: 'all',    label: 'כל העדיפויות' },
@@ -1165,15 +1732,16 @@ function renderTaskCard(task, cid, pid, opts) {
   const tickAttrs = isRunning ? `data-tick data-base="${task.timeTotal || 0}"` : '';
 
   const draggable = state.filters.sortBy === 'manual';
-  return `<div class="task-card ${selected ? 'selected' : ''} ${task.status === STATUS.DONE ? 'task-done' : ''}"
+  const effStatus = effectiveStatus(task);
+  return `<div class="task-card ${selected ? 'selected' : ''} ${effStatus === STATUS.DONE ? 'task-done' : ''}"
       ${draggable ? `draggable="true" data-task-id="${task.id}" data-client-id="${cid}" data-project-id="${pid}"` : ''}
       onclick="selectTask('${cid}','${pid}','${task.id}')">
-    <button class="status-btn status-${task.status}"
+    <button class="status-btn status-${effStatus}"
       onclick="event.stopPropagation();cycleStatus('${cid}','${pid}','${task.id}')"
-      title="${STATUS_LABELS[task.status]}">${task.status === STATUS.DONE ? '✓' : task.status === STATUS.IN_PROGRESS ? '◐' : ''}</button>
+      title="${STATUS_LABELS[effStatus]}">${effStatus === STATUS.DONE ? '✓' : effStatus === STATUS.IN_PROGRESS ? '◐' : ''}</button>
     <div class="task-card-body">
       <div class="task-card-row1">
-        <span class="task-title ${task.status === STATUS.DONE ? 'done' : ''}">${esc(task.title)}</span>
+        <span class="task-title ${effStatus === STATUS.DONE ? 'done' : ''}">${esc(task.title)}</span>
       </div>
       ${showProject ? `<div class="task-project-label">
         <span class="project-dot sm" style="background:${projectColor}"></span>
@@ -1182,7 +1750,10 @@ function renderTaskCard(task, cid, pid, opts) {
       <div class="task-meta">
         <span class="badge badge-${task.priority}">${PRIORITY_LABELS[task.priority] || task.priority}</span>
         ${(task.tags || []).map(t => `<span class="badge badge-tag">${esc(t)}</span>`).join('')}
-        ${task.dueDate ? `<span class="badge badge-date ${overdue ? 'overdue' : ''}">${overdue ? '⚠ ' : ''}${formatDisplayDate(task.dueDate)}</span>` : ''}
+        ${effStatus === STATUS.DONE && task.completedAt
+          ? `<span class="badge badge-completed">✓ ${new Date(task.completedAt).toLocaleDateString('he-IL', { day: 'numeric', month: 'short', year: 'numeric' })}</span>`
+          : task.dueDate ? `<span class="badge badge-date ${overdue ? 'overdue' : ''}">${overdue ? '⚠ ' : ''}${formatDisplayDate(task.dueDate)}</span>` : ''}
+        ${task.recurring ? `<span class="badge badge-recurring" title="חוזרת כל ${task.recurring.frequency === 'daily' ? 'יום' : task.recurring.frequency === 'weekly' ? 'שבוע' : task.recurring.frequency === 'monthly' ? 'חודש' : task.recurring.interval + ' ימים'}">🔁</span>` : ''}
         ${subtasksTotal > 0 ? `<span class="badge badge-subtasks">${subtasksDone}/${subtasksTotal} תתי-משימות</span>` : ''}
         ${ep?.over ? `<span class="badge badge-over">⚠ חריגה מהתכנון</span>` : ''}
       </div>
@@ -1260,14 +1831,19 @@ function buildTaskPanel(task, cid, pid) {
         <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteTask('${cid}','${pid}','${task.id}')">🗑️</button>
       </div>
     </div>
-    <div class="panel-body">
+    <div class="panel-tabs">
+      <button class="panel-tab ${panelActiveTab==='details'?'active':''}" onclick="setPanelTab('details')">פרטים</button>
+      <button class="panel-tab ${panelActiveTab==='log'?'active':''}" onclick="setPanelTab('log')">לוג פעילות</button>
+    </div>
+
+    ${panelActiveTab === 'log' ? `<div class="panel-body panel-log-body">${buildActivityLog(task)}</div>` : `<div class="panel-body">
 
       <!-- Title -->
       <div class="panel-title-row">
-        <button class="status-btn status-${task.status}"
+        <button class="status-btn status-${effectiveStatus(task)}"
           onclick="cycleStatus('${cid}','${pid}','${task.id}')"
-          title="${STATUS_LABELS[task.status]}">${task.status === STATUS.DONE ? '✓' : task.status === STATUS.IN_PROGRESS ? '◐' : ''}</button>
-        <input class="panel-title-input ${task.status === STATUS.DONE ? 'done' : ''}"
+          title="${STATUS_LABELS[effectiveStatus(task)]}">${effectiveStatus(task) === STATUS.DONE ? '✓' : effectiveStatus(task) === STATUS.IN_PROGRESS ? '◐' : ''}</button>
+        <input class="panel-title-input ${effectiveStatus(task) === STATUS.DONE ? 'done' : ''}"
           value="${esc(task.title)}"
           onblur="saveTaskField('${cid}','${pid}','${task.id}','title',this.value)"
           onkeydown="if(event.key==='Enter')this.blur()">
@@ -1285,11 +1861,12 @@ function buildTaskPanel(task, cid, pid) {
         </div>
         <div class="panel-field">
           <label>סטטוס</label>
-          ${renderCsel('panel-status', [
-            { value: 'open',        label: 'פתוח'   },
-            { value: 'in-progress', label: 'בביצוע' },
-            { value: 'done',        label: 'הושלם'  },
-          ], task.status, `saveTaskField('${cid}','${pid}','${task.id}','status',{val},true)`)}
+          ${effectiveStatus(task) === STATUS.IN_PROGRESS
+            ? `<span class="panel-status-derived">◐ בביצוע</span>`
+            : renderCsel('panel-status', [
+                { value: 'open', label: 'פתוח'  },
+                { value: 'done', label: 'הושלם' },
+              ], task.status, `saveTaskField('${cid}','${pid}','${task.id}','status',{val},true)`)}
         </div>
         <div class="panel-field">
           <label>תאריך יעד</label>
@@ -1300,6 +1877,34 @@ function buildTaskPanel(task, cid, pid) {
           <label>משוער (דק')</label>
           <input type="number" class="panel-select" value="${task.estimatedMinutes||''}" min="0" step="15" placeholder="—"
             onblur="saveTaskField('${cid}','${pid}','${task.id}','estimatedMinutes',parseInt(this.value)||null)">
+        </div>
+      </div>
+
+      <!-- Recurring -->
+      <div class="panel-field-block panel-recurring">
+        <label>חזרתיות</label>
+        <div class="panel-recurring-row">
+          <label class="recurring-toggle">
+            <input type="checkbox" id="panel-rec-on"
+              ${task.recurring ? 'checked' : ''}
+              onchange="togglePanelRecurring('${cid}','${pid}','${task.id}')">
+            <span>חוזרת</span>
+          </label>
+          <div id="panel-rec-opts" style="display:${task.recurring ? 'flex' : 'none'};gap:8px;align-items:center">
+            <select id="panel-rec-freq"
+              onchange="savePanelRecurring('${cid}','${pid}','${task.id}')">
+              <option value="daily"   ${task.recurring?.frequency==='daily'   ? 'selected':''}>כל יום</option>
+              <option value="weekly"  ${task.recurring?.frequency==='weekly'  ? 'selected':''}>כל שבוע</option>
+              <option value="monthly" ${task.recurring?.frequency==='monthly' ? 'selected':''}>כל חודש</option>
+              <option value="custom"  ${task.recurring?.frequency==='custom'  ? 'selected':''}>כל X ימים</option>
+            </select>
+            <input id="panel-rec-interval" type="number" min="1" max="365"
+              value="${task.recurring?.interval || 7}"
+              style="width:60px;display:${task.recurring?.frequency==='custom' ? 'block' : 'none'}"
+              placeholder="ימים"
+              onchange="savePanelRecurring('${cid}','${pid}','${task.id}')">
+          </div>
+          ${task.recurring ? `<span class="panel-recurring-next">הבאה: ${formatDisplayDate(nextRecurringDate(task))}</span>` : ''}
         </div>
       </div>
 
@@ -1339,8 +1944,97 @@ function buildTaskPanel(task, cid, pid) {
         <input class="subtask-quick-add" placeholder="＋ הוסף תת-משימה..." onkeydown="addPanelSubtask(event,'${cid}','${pid}','${task.id}')">
       </div>
 
-    </div>
+    </div>`}
   </div>`;
+}
+
+function buildActivityLog(task) {
+  const timeEntries = task.timeEntries || [];
+  const activityLog = task.activityLog || [];
+
+  const allEntries = [
+    ...timeEntries.map(e => ({ ts: e.start,     type: 'work', entry: e })),
+    ...activityLog.map(a => ({ ts: a.timestamp, type: a.type           })),
+  ].sort((a, b) => b.ts - a.ts);
+
+  const totalSecs    = timeEntries.reduce((s, e) => s + (e.seconds || 0), 0);
+  const sessionCount = timeEntries.length;
+  const doneCount    = activityLog.filter(a => a.type === 'done').length;
+
+  const summaryHtml = (totalSecs > 0 || doneCount > 0) ? `
+    <div class="log-summary">
+      <div class="log-summary-item">
+        <span class="log-summary-val">${formatTime(totalSecs)}</span>
+        <span class="log-summary-lbl">זמן כולל</span>
+      </div>
+      <div class="log-summary-sep"></div>
+      <div class="log-summary-item">
+        <span class="log-summary-val">${sessionCount}</span>
+        <span class="log-summary-lbl">סשנים</span>
+      </div>
+      <div class="log-summary-sep"></div>
+      <div class="log-summary-item">
+        <span class="log-summary-val">${doneCount}</span>
+        <span class="log-summary-lbl">פעמי סגירה</span>
+      </div>
+    </div>` : '';
+
+  if (!allEntries.length) {
+    return `${summaryHtml}<div class="log-empty">
+      <div class="log-empty-icon">📋</div>
+      <div class="log-empty-text">אין פעילות מתועדת עדיין</div>
+    </div>`;
+  }
+
+  const fmtTime = ts => new Date(ts).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' });
+
+  // Group by YYYY-MM-DD for correct sort order
+  const byDate = {};
+  for (const e of allEntries) {
+    const key = new Date(e.ts).toISOString().split('T')[0];
+    const lbl = new Date(e.ts).toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
+    if (!byDate[key]) byDate[key] = { lbl, items: [] };
+    byDate[key].items.push(e);
+  }
+
+  let html = summaryHtml;
+  for (const key of Object.keys(byDate).sort().reverse()) {
+    const { lbl, items } = byDate[key];
+    let rows = '';
+    for (const item of items) {
+      if (item.type === 'work') {
+        const e = item.entry;
+        rows += `<div class="log-entry log-work">
+          <div class="log-dot">⏱</div>
+          <div class="log-content">
+            <div class="log-label">סשן עבודה <span class="log-badge log-badge-time">${formatTime(e.seconds)}</span></div>
+            <div class="log-meta">${fmtTime(e.start)} – ${fmtTime(e.end)}</div>
+          </div>
+        </div>`;
+      } else if (item.type === 'done') {
+        rows += `<div class="log-entry log-done">
+          <div class="log-dot">✓</div>
+          <div class="log-content">
+            <div class="log-label">סומן כהושלם <span class="log-badge log-badge-done">הושלם</span></div>
+            <div class="log-meta">${fmtTime(item.ts)}</div>
+          </div>
+        </div>`;
+      } else if (item.type === 'reopened') {
+        rows += `<div class="log-entry log-reopened">
+          <div class="log-dot">↩</div>
+          <div class="log-content">
+            <div class="log-label">נפתח מחדש <span class="log-badge log-badge-open">פתוח</span></div>
+            <div class="log-meta">${fmtTime(item.ts)}</div>
+          </div>
+        </div>`;
+      }
+    }
+    html += `<div class="log-date-group">
+      <div class="log-date-label">${lbl}</div>
+      <div class="log-timeline">${rows}</div>
+    </div>`;
+  }
+  return html;
 }
 
 // Save a single task field without re-rendering the panel (preserves focus)
@@ -1348,6 +2042,28 @@ function saveTaskField(cid, pid, tid, field, value, rerenderPanel = false) {
   updateTask(cid, pid, tid, { [field]: value });
   renderSidebar();
   if (rerenderPanel) renderTaskPanel();
+}
+
+function setPanelTab(tab) {
+  panelActiveTab = tab;
+  renderTaskPanel();
+}
+
+function togglePanelRecurring(cid, pid, tid) {
+  const on = document.getElementById('panel-rec-on')?.checked;
+  const opts = document.getElementById('panel-rec-opts');
+  if (opts) opts.style.display = on ? 'flex' : 'none';
+  if (on) { savePanelRecurring(cid, pid, tid); }
+  else { updateTask(cid, pid, tid, { recurring: null }); renderTaskPanel(); }
+}
+
+function savePanelRecurring(cid, pid, tid) {
+  const freq = document.getElementById('panel-rec-freq')?.value || 'weekly';
+  const intEl = document.getElementById('panel-rec-interval');
+  if (intEl) intEl.style.display = freq === 'custom' ? 'block' : 'none';
+  const interval = freq === 'custom' ? (parseInt(intEl?.value, 10) || 7) : null;
+  updateTask(cid, pid, tid, { recurring: { frequency: freq, ...(interval ? { interval } : {}) } });
+  renderTaskPanel();
 }
 
 function saveSubtaskField(cid, pid, tid, sid, field, value) {
@@ -1573,6 +2289,14 @@ function showAddTaskModal(cid, pid) {
   );
 }
 
+function readRecurringFromForm() {
+  const on = document.getElementById('f-recurring-on')?.checked;
+  if (!on) return null;
+  const frequency = document.getElementById('f-rec-freq')?.value || 'weekly';
+  const interval  = frequency === 'custom' ? (parseInt(document.getElementById('f-rec-interval')?.value, 10) || 7) : null;
+  return { frequency, ...(interval ? { interval } : {}) };
+}
+
 function submitAddTask(cid, pid) {
   const title = fval('f-title');
   if (!title) { showToast('כותרת המשימה חובה', 'error'); return; }
@@ -1582,7 +2306,8 @@ function submitAddTask(cid, pid) {
     title, description: fval('f-desc'),
     priority: document.getElementById('f-priority')?.value || 'medium',
     dueDate: fval('f-due') || null, tags,
-    estimatedMinutes: estRaw > 0 ? estRaw : null
+    estimatedMinutes: estRaw > 0 ? estRaw : null,
+    recurring: readRecurringFromForm()
   });
   closeModal(); selectTask(cid, pid, t.id);
 }
@@ -1606,7 +2331,7 @@ function submitEditTask(cid, pid, tid) {
     dueDate: fval('f-due') || null,
     status: document.getElementById('f-status')?.value || 'open',
     estimatedMinutes: estRaw2 > 0 ? estRaw2 : null,
-    tags
+    tags, recurring: readRecurringFromForm()
   });
   closeModal(); render();
 }
@@ -1634,9 +2359,35 @@ function buildTaskForm(t) {
     ${t.status !== undefined ? `<div class="form-group"><label>סטטוס</label>
       <select id="f-status">
         <option value="open" ${sSel('open')}>פתוח</option>
-        <option value="in-progress" ${sSel('in-progress')}>בביצוע</option>
         <option value="done" ${sSel('done')}>הושלם</option>
-      </select></div>` : ''}`;
+      </select></div>` : ''}
+    <div class="form-group recurring-group">
+      <label class="recurring-label">
+        <input type="checkbox" id="f-recurring-on" ${t.recurring ? 'checked' : ''}
+          onchange="toggleRecurringUI()"> משימה חוזרת 🔁
+      </label>
+      <div id="recurring-opts" style="display:${t.recurring ? 'flex' : 'none'};gap:10px;margin-top:6px;align-items:center">
+        <select id="f-rec-freq" onchange="toggleRecurringUI()">
+          <option value="daily"   ${(t.recurring?.frequency||'weekly')==='daily'   ? 'selected':''}>כל יום</option>
+          <option value="weekly"  ${(t.recurring?.frequency||'weekly')==='weekly'  ? 'selected':''}>כל שבוע</option>
+          <option value="monthly" ${(t.recurring?.frequency||'weekly')==='monthly' ? 'selected':''}>כל חודש</option>
+          <option value="custom"  ${(t.recurring?.frequency||'weekly')==='custom'  ? 'selected':''}>כל X ימים</option>
+        </select>
+        <input id="f-rec-interval" type="number" min="1" max="365"
+          value="${t.recurring?.interval || 7}"
+          style="width:70px;display:${(t.recurring?.frequency)==='custom'?'block':'none'}"
+          placeholder="ימים">
+      </div>
+    </div>`;
+}
+
+function toggleRecurringUI() {
+  const on  = document.getElementById('f-recurring-on')?.checked;
+  const box = document.getElementById('recurring-opts');
+  const frq = document.getElementById('f-rec-freq')?.value;
+  const inp = document.getElementById('f-rec-interval');
+  if (box) box.style.display = on ? 'flex' : 'none';
+  if (inp) inp.style.display = frq === 'custom' ? 'block' : 'none';
 }
 
 // ============================================================
@@ -1752,7 +2503,194 @@ function confirmDeleteSubtask(cid, pid, tid, sid) {
 }
 
 // ============================================================
-// MODAL — SETTINGS
+// SETTINGS VIEW
+// ============================================================
+const SETTINGS_SECTIONS = [
+  { key: 'business',     icon: '🏢', label: 'פרטי עסק' },
+  { key: 'integrations', icon: '🔗', label: 'אינטגרציות', header: true },
+  { key: 'clockify',     icon: '⏱', label: 'Clockify' },
+  { key: 'greenapi',     icon: '💬', label: 'Green API' },
+  { key: 'accounting',   icon: '📒', label: 'חשבונאות' },
+];
+
+function setSettingsSection(key) {
+  state.settingsSection = key;
+  saveState(); renderMain();
+}
+
+function renderSettingsView() {
+  const section = state.settingsSection || 'business';
+  const b  = state.business     || {};
+  const ci = (state.integrations || {}).clockify   || {};
+  const gi = (state.integrations || {}).greenapi   || {};
+  const ai = (state.integrations || {}).accounting || {};
+
+  // ---- Sidebar nav ----
+  let navHtml = '';
+  for (const s of SETTINGS_SECTIONS) {
+    if (s.header) {
+      navHtml += `<div class="settings-nav-header">${s.label}</div>`;
+      continue;
+    }
+    navHtml += `<button class="settings-nav-item ${section === s.key ? 'active' : ''}"
+      onclick="setSettingsSection('${s.key}')">${s.icon} ${s.label}</button>`;
+  }
+
+  // ---- Section content ----
+  let content = '';
+
+  if (section === 'business') {
+    content = `
+      <div class="settings-section-title">🏢 פרטי עסק</div>
+      <div class="settings-card">
+        <div class="settings-grid">
+          <div class="settings-field">
+            <label>שם העסק</label>
+            <input id="s-biz-name" class="settings-input" value="${esc(b.name||'')}" placeholder="שם העסק שלך">
+          </div>
+          <div class="settings-field">
+            <label>תיאור קצר</label>
+            <input id="s-biz-tagline" class="settings-input" value="${esc(b.tagline||'')}" placeholder="מה אתה עושה?">
+          </div>
+          <div class="settings-field">
+            <label>אימייל</label>
+            <input id="s-biz-email" class="settings-input" type="email" value="${esc(b.email||'')}" placeholder="info@example.com">
+          </div>
+          <div class="settings-field">
+            <label>טלפון</label>
+            <input id="s-biz-phone" class="settings-input" value="${esc(b.phone||'')}" placeholder="050-0000000">
+          </div>
+          <div class="settings-field">
+            <label>כתובת</label>
+            <input id="s-biz-address" class="settings-input" value="${esc(b.address||'')}" placeholder="רחוב, עיר">
+          </div>
+          <div class="settings-field">
+            <label>ח.פ / ע.מ</label>
+            <input id="s-biz-taxid" class="settings-input" value="${esc(b.taxId||'')}" placeholder="מספר עוסק">
+          </div>
+          <div class="settings-field">
+            <label>אתר אינטרנט</label>
+            <input id="s-biz-website" class="settings-input" value="${esc(b.website||'')}" placeholder="https://...">
+          </div>
+          <div class="settings-field">
+            <label>לוגו (URL תמונה)</label>
+            <input id="s-biz-logo" class="settings-input" value="${esc(b.logoUrl||'')}" placeholder="https://...">
+          </div>
+        </div>
+      </div>
+      <div class="settings-actions">
+        <button class="btn btn-primary" onclick="saveBusinessSettings()">💾 שמור שינויים</button>
+      </div>`;
+  }
+
+  else if (section === 'clockify') {
+    const connected = !!(ci.apiKey || state.clockifyApiKey);
+    content = `
+      <div class="settings-section-title">⏱ Clockify</div>
+      <div class="settings-integration-hero ${connected ? 'connected' : ''}">
+        <div class="integration-logo">⏱</div>
+        <div class="integration-hero-info">
+          <div class="integration-hero-name">Clockify</div>
+          <div class="integration-hero-desc">מעקב זמן ושעות עבודה — סנכרון אוטומטי בהפעלת שעון</div>
+        </div>
+        <span class="integration-status-badge ${connected ? 'on' : 'off'}">${connected ? '● מחובר' : '○ לא מחובר'}</span>
+      </div>
+      <div class="settings-card">
+        <div class="settings-grid">
+          <div class="settings-field settings-field-full">
+            <label>API Key</label>
+            <input id="s-ck-apikey" class="settings-input" value="${esc(ci.apiKey || state.clockifyApiKey || '')}" placeholder="הדבק את מפתח ה-API">
+            <span class="settings-hint">נמצא בהגדרות הפרופיל שלך ב-Clockify &rarr; Profile Settings &rarr; API</span>
+          </div>
+          <div class="settings-field">
+            <label>Workspace ID</label>
+            <input id="s-ck-wsid" class="settings-input" value="${esc(ci.workspaceId || CLOCKIFY_WORKSPACE)}" placeholder="Workspace ID">
+          </div>
+          <div class="settings-field">
+            <label>User ID</label>
+            <input id="s-ck-uid" class="settings-input" value="${esc(ci.userId || CLOCKIFY_USER_ID)}" placeholder="User ID">
+          </div>
+        </div>
+      </div>
+      <div class="settings-actions">
+        <button class="btn btn-primary" onclick="saveClockifySettings()">💾 שמור</button>
+      </div>`;
+  }
+
+  else if (section === 'greenapi') {
+    content = `
+      <div class="settings-section-title">💬 Green API — WhatsApp</div>
+      <div class="settings-integration-hero">
+        <div class="integration-logo">💬</div>
+        <div class="integration-hero-info">
+          <div class="integration-hero-name">Green API</div>
+          <div class="integration-hero-desc">שליחת עדכונים ותזכורות ללקוחות דרך WhatsApp</div>
+        </div>
+        <span class="integration-status-badge off">○ בקרוב</span>
+      </div>
+      <div class="settings-coming-soon">
+        <div class="coming-soon-icon">🚧</div>
+        <div class="coming-soon-title">בפיתוח</div>
+        <div class="coming-soon-desc">אינטגרציה עם Green API תאפשר שליחת הודעות WhatsApp אוטומטיות ללקוחות</div>
+      </div>`;
+  }
+
+  else if (section === 'accounting') {
+    content = `
+      <div class="settings-section-title">📒 חשבונאות</div>
+      <div class="settings-integration-hero">
+        <div class="integration-logo">📒</div>
+        <div class="integration-hero-info">
+          <div class="integration-hero-name">חשבונאות</div>
+          <div class="integration-hero-desc">חיבור לתוכנת חשבונאות — הפקת חשבוניות אוטומטיות</div>
+        </div>
+        <span class="integration-status-badge off">○ בקרוב</span>
+      </div>
+      <div class="settings-coming-soon">
+        <div class="coming-soon-icon">🚧</div>
+        <div class="coming-soon-title">בפיתוח</div>
+        <div class="coming-soon-desc">תמיכה ב-חשבשבת, Priority, ו-iCount — הפקת חשבוניות ישירות ממסך הלקוח</div>
+      </div>`;
+  }
+
+  return `<div class="settings-layout">
+    <nav class="settings-nav">${navHtml}</nav>
+    <div class="settings-content">${content}</div>
+  </div>`;
+}
+
+function saveBusinessSettings() {
+  state.business = {
+    name:    document.getElementById('s-biz-name')?.value    || '',
+    tagline: document.getElementById('s-biz-tagline')?.value || '',
+    email:   document.getElementById('s-biz-email')?.value   || '',
+    phone:   document.getElementById('s-biz-phone')?.value   || '',
+    address: document.getElementById('s-biz-address')?.value || '',
+    taxId:   document.getElementById('s-biz-taxid')?.value   || '',
+    website: document.getElementById('s-biz-website')?.value || '',
+    logoUrl: document.getElementById('s-biz-logo')?.value    || '',
+  };
+  saveState();
+  showToast('פרטי עסק נשמרו ✓', 'success');
+}
+
+function saveClockifySettings() {
+  const apiKey = document.getElementById('s-ck-apikey')?.value || '';
+  const wsId   = document.getElementById('s-ck-wsid')?.value   || '';
+  const uid    = document.getElementById('s-ck-uid')?.value    || '';
+  state.clockifyApiKey = apiKey;
+  if (!state.integrations) state.integrations = {};
+  if (!state.integrations.clockify) state.integrations.clockify = {};
+  state.integrations.clockify.apiKey      = apiKey;
+  state.integrations.clockify.workspaceId = wsId;
+  state.integrations.clockify.userId      = uid;
+  saveState();
+  showToast('הגדרות Clockify נשמרו ✓', 'success');
+  renderMain();
+}
+
+// ============================================================
+// MODAL — SETTINGS (legacy, kept for compatibility)
 // ============================================================
 function openSettings() {
   showModal('הגדרות',
@@ -2345,7 +3283,7 @@ function _quickAddDone(cid, pid, msg) {
   const prev = document.getElementById('quick-add-preview');
   if (prev) prev.innerHTML = '';
   state.selectedClientId = cid; state.selectedProjectId = pid;
-  state.currentView = 'project'; state.filters.status = 'all';
+  state.currentView = 'project'; state.filters.status = STATUS.OPEN;
   saveState(); render();
   showToast(msg, 'success');
   setTimeout(() => document.getElementById('quick-add-input')?.focus(), 50);
@@ -2387,7 +3325,7 @@ function submitQuickTask() {
     state.selectedClientId = cid;
     state.selectedProjectId = pid;
     state.currentView = 'project';
-    state.filters.status = 'all';
+    state.filters.status = STATUS.OPEN;
     saveState();
   }
   render();
