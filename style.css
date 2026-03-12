@@ -578,6 +578,7 @@ body {
 .billing-amount { color: #059669; font-weight: 700; font-size: 13px; }
 .billing-amount.total { font-size: 14px; background: #d1fae5; padding: 2px 8px; border-radius: 8px; }
 .toggle-label { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; }
+
 .toggle-label input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
 
 .timer-btn {

@@ -463,6 +463,41 @@ function startTimer(cid, pid, tid, sid = null) {
   }
 }
 
+function startProjectPlanningTimer(cid, pid) {
+  if (state.activeTimer) stopTimer();
+
+  const startTime = Date.now();
+  state.activeTimer = {
+    type: 'planning',
+    clientId: cid, projectId: pid, taskId: null, subtaskId: null,
+    startTime,
+    clockifyEntryId: null
+  };
+  saveState();
+  startTimerTick();
+  render();
+
+  if (state.clockifyApiKey) {
+    const c = getClient(cid);
+    const p = getProject(cid, pid);
+    clockifyStartEntry({
+      clientName:  c?.name || '',
+      projectName: p?.name || '',
+      clientId:    cid,
+      projectId:   pid,
+      taskName:    'אפיון ותכנון',
+      description: '',
+      billable:    p?.billable || false,
+      startTime
+    }).then(entryId => {
+      if (entryId && state.activeTimer) {
+        state.activeTimer.clockifyEntryId = entryId;
+        saveState();
+      }
+    });
+  }
+}
+
 function stopTimer() {
   const at = state.activeTimer;
   if (!at) return;
@@ -470,46 +505,49 @@ function stopTimer() {
   const secs    = elapsed(at.startTime);
   const endTime = at.startTime + secs * 1000;
 
-  // Accumulate time locally + log the entry with timestamp
-  const timeEntry = {
-    id: uuid(),
-    date:    new Date(endTime).toISOString().split('T')[0],  // YYYY-MM-DD
-    start:   at.startTime,
-    end:     endTime,
-    seconds: secs
-  };
-  if (at.type === 'subtask') {
-    const s = getSubtask(at.clientId, at.projectId, at.taskId, at.subtaskId);
-    if (s) { s.timeTotal = (s.timeTotal || 0) + secs; (s.timeEntries = s.timeEntries || []).push(timeEntry); }
-  } else {
-    const t = getTask(at.clientId, at.projectId, at.taskId);
-    if (t) {
-      t.timeTotal = (t.timeTotal || 0) + secs;
-      (t.timeEntries = t.timeEntries || []).push(timeEntry);
+  // Accumulate time locally (not for planning timers — no task)
+  if (at.type !== 'planning') {
+    const timeEntry = {
+      id: uuid(),
+      date:    new Date(endTime).toISOString().split('T')[0],
+      start:   at.startTime,
+      end:     endTime,
+      seconds: secs
+    };
+    if (at.type === 'subtask') {
+      const s = getSubtask(at.clientId, at.projectId, at.taskId, at.subtaskId);
+      if (s) { s.timeTotal = (s.timeTotal || 0) + secs; (s.timeEntries = s.timeEntries || []).push(timeEntry); }
+    } else {
+      const t = getTask(at.clientId, at.projectId, at.taskId);
+      if (t) { t.timeTotal = (t.timeTotal || 0) + secs; (t.timeEntries = t.timeEntries || []).push(timeEntry); }
     }
   }
 
   // Stop Clockify entry
   if (state.clockifyApiKey) {
     if (at.clockifyEntryId) {
-      // entry was opened live — just stop it
       clockifyStopEntry(at.clockifyEntryId, endTime);
     } else {
-      // fallback: entry wasn't opened yet (very fast stop) — create full entry
       const c = getClient(at.clientId);
       const p = getProject(at.clientId, at.projectId);
-      const t = getTask(at.clientId, at.projectId, at.taskId);
-      const s = at.subtaskId ? getSubtask(at.clientId, at.projectId, at.taskId, at.subtaskId) : null;
-      clockifyCreateEntry({
-        clientName:  c?.name || '',
-        projectName: p?.name || '',
-        clientId:    at.clientId,
-        projectId:   at.projectId,
-        taskName:    s ? s.title : (t?.title || ''),
-        description: s ? (s.description || '') : (t?.description || ''),
-        billable:    p?.billable || false,
-        start: at.startTime, end: endTime
-      });
+      if (at.type === 'planning') {
+        clockifyCreateEntry({
+          clientName: c?.name || '', projectName: p?.name || '',
+          clientId: at.clientId, projectId: at.projectId,
+          taskName: 'אפיון ותכנון', description: '',
+          billable: p?.billable || false, start: at.startTime, end: endTime
+        });
+      } else {
+        const t = getTask(at.clientId, at.projectId, at.taskId);
+        const s = at.subtaskId ? getSubtask(at.clientId, at.projectId, at.taskId, at.subtaskId) : null;
+        clockifyCreateEntry({
+          clientName:  c?.name || '', projectName: p?.name || '',
+          clientId:    at.clientId, projectId:   at.projectId,
+          taskName:    s ? s.title : (t?.title || ''),
+          description: s ? (s.description || '') : (t?.description || ''),
+          billable:    p?.billable || false, start: at.startTime, end: endTime
+        });
+      }
     }
   }
 
@@ -1624,6 +1662,7 @@ function renderProjectCard(cid, p, isArchivedView = false) {
         ? `<button class="btn-icon" onclick="unarchiveProject('${cid}','${p.id}')" title="שחזר">↩️ שחזר</button>
            <button class="btn-icon danger" onclick="confirmDeleteProject('${cid}','${p.id}')" title="מחיקה">🗑️</button>`
         : `${isInbox ? `<button class="btn-icon" onclick="showAssignClientModal('${cid}','${p.id}')" title="שייך ללקוח">🔗</button>` : ''}
+           ${(() => { const at = state.activeTimer; const isPlanning = at && at.type === 'planning' && at.projectId === p.id; return `<button class="btn-icon ${isPlanning ? 'running' : ''}" onclick="${isPlanning ? 'stopTimer()' : `startProjectPlanningTimer('${cid}','${p.id}')`}" title="אפיון ותכנון">${isPlanning ? '⏸' : '⏱'}</button>`; })()}
            <button class="btn-icon" onclick="showEditProjectModal('${cid}','${p.id}')" title="עריכה">✏️</button>
            <button class="btn-icon" onclick="archiveProject('${cid}','${p.id}')" title="ארכיון">📦</button>
            <button class="btn-icon danger" onclick="confirmDeleteProject('${cid}','${p.id}')" title="מחיקה">🗑️</button>`
@@ -1671,6 +1710,7 @@ function renderProjectView() {
         </div>
       </div>
       <div class="view-actions">
+        ${(() => { const at = state.activeTimer; const isPlanning = at && at.type === 'planning' && at.projectId === p.id; return `<button class="btn ${isPlanning ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="${isPlanning ? 'stopTimer()' : `startProjectPlanningTimer('${c.id}','${p.id}')`}" title="אפיון ותכנון">${isPlanning ? '⏸ עצור' : '⏱ אפיון ותכנון'}</button>`; })()}
         <button class="btn btn-ghost btn-sm" onclick="showEditProjectModal('${c.id}','${p.id}')">✏️</button>
         <button class="btn btn-ghost btn-sm" onclick="archiveProject('${c.id}','${p.id}')" title="העבר לארכיון">📦</button>
         <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteProject('${c.id}','${p.id}')">🗑️</button>
@@ -2136,11 +2176,12 @@ function renderActiveTimer() {
   const at = state.activeTimer;
   if (!at) { el.innerHTML = ''; return; }
 
-  const task    = getTask(at.clientId, at.projectId, at.taskId);
-  const sub     = at.subtaskId ? getSubtask(at.clientId, at.projectId, at.taskId, at.subtaskId) : null;
   const project = getProject(at.clientId, at.projectId);
-  const label   = sub ? sub.title : (task?.title || '');
-  const base    = (sub ? sub.timeTotal : task?.timeTotal) || 0;
+  const isPlanningTimer = at.type === 'planning';
+  const task    = isPlanningTimer ? null : getTask(at.clientId, at.projectId, at.taskId);
+  const sub     = isPlanningTimer ? null : (at.subtaskId ? getSubtask(at.clientId, at.projectId, at.taskId, at.subtaskId) : null);
+  const label   = isPlanningTimer ? 'אפיון ותכנון' : (sub ? sub.title : (task?.title || ''));
+  const base    = isPlanningTimer ? 0 : ((sub ? sub.timeTotal : task?.timeTotal) || 0);
 
   el.innerHTML = `<div class="active-timer-widget">
     <div class="active-timer-info">
