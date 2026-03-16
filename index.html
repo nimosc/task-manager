@@ -9,6 +9,7 @@
   <link rel="icon" type="image/png" href="LOGO1.png" sizes="128x128">
   <link rel="apple-touch-icon" href="LOGO1.png">
   <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
   <div id="app">
@@ -17,7 +18,8 @@
     <aside id="sidebar">
       <div class="sidebar-header">
         <div class="sidebar-logo">
-          <img src="Logo2.png" alt="Task Manager" class="logo-img">
+          <img src="Logo2.png" alt="Task Manager" class="logo-img logo-full">
+          <img src="LOGO1.png" alt="Task Manager" class="logo-img logo-mini">
         </div>
       </div>
 
@@ -26,8 +28,9 @@
       <nav id="sidebar-nav"></nav>
 
       <div class="sidebar-footer">
-        <button class="add-client-btn" onclick="showAddClientModal()">＋ לקוח חדש</button>
-        <button class="icon-btn settings-footer-btn" onclick="navigateTo('settings')" title="הגדרות">⚙ הגדרות</button>
+        <button class="add-client-btn" onclick="showAddClientModal()"><span class="sb-icon">＋</span><span class="sb-label"> לקוח חדש</span></button>
+        <button class="icon-btn settings-footer-btn" onclick="goReports()" title="דוחות"><span class="sb-icon">📁</span><span class="sb-label"> דוחות</span></button>
+        <button class="icon-btn settings-footer-btn" onclick="navigateTo('settings')" title="הגדרות"><span class="sb-icon">⚙</span><span class="sb-label"> הגדרות</span></button>
       </div>
     </aside>
 

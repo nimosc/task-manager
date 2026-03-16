@@ -11,6 +11,71 @@ const STORAGE_KEY = 'taskmanager_v2';
 const CLOCKIFY_WORKSPACE = '6386f7b7f4b38507be1e5f5a';
 const CLOCKIFY_USER_ID   = '6386f7b7f4b38507be1e5f59';
 
+// ============================================================
+// SUPABASE
+// ============================================================
+const SUPABASE_URL      = 'https://szjlcnprjwlnntlryqpz.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN6amxjbnByandsbm50bHJ5cXB6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1OTQzODksImV4cCI6MjA4OTE3MDM4OX0.CLXsRmfDjqIKcSWoSBRGIST5OFtocVp_tQqSBhUBN2I';
+const SUPABASE_STATE_ID = 'default';
+let _supabase = null;
+
+function initSupabase() {
+  try {
+    if (typeof window.supabase !== 'undefined' && window.supabase.createClient) {
+      _supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    }
+  } catch(e) {
+    console.warn('Supabase init failed:', e);
+  }
+}
+
+let _saveSupabaseTimer = null;
+function saveToSupabase() {
+  if (!_supabase) return;
+  clearTimeout(_saveSupabaseTimer);
+  _saveSupabaseTimer = setTimeout(async () => {
+    try {
+      await _supabase.from('app_state').upsert({
+        id: SUPABASE_STATE_ID,
+        data: state,
+        updated_at: new Date().toISOString()
+      });
+    } catch(e) {
+      console.warn('Supabase save failed:', e);
+    }
+  }, 1000);
+}
+
+async function syncFromSupabase() {
+  if (!_supabase) return;
+  try {
+    const { data, error } = await _supabase
+      .from('app_state')
+      .select('data')
+      .eq('id', SUPABASE_STATE_ID)
+      .single();
+    if (error || !data || !data.data) return;
+    const remote = data.data;
+    const def = defaultState();
+    state = Object.assign(def, remote);
+    try { state.business = Object.assign(def.business, remote.business || {}); } catch(e) {}
+    try {
+      const si = remote.integrations || {};
+      const di = def.integrations   || {};
+      state.integrations            = Object.assign(di, si);
+      state.integrations.clockify   = Object.assign({}, di.clockify   || {}, si.clockify   || {});
+      state.integrations.greenapi   = Object.assign({}, di.greenapi   || {}, si.greenapi   || {});
+      state.integrations.accounting = Object.assign({}, di.accounting || {}, si.accounting || {});
+      state.integrations.claude     = Object.assign({}, { apiKey: '' },      si.claude     || {});
+    } catch(e) { state.integrations = def.integrations; }
+    if (!state.clients) state.clients = remote.clients || [];
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    render();
+  } catch(e) {
+    console.warn('Supabase sync failed:', e);
+  }
+}
+
 const STATUS = { OPEN: 'open', IN_PROGRESS: 'in-progress', DONE: 'done' };
 const STATUS_LABELS = { open: 'פתוח', 'in-progress': 'בביצוע', done: 'הושלם' };
 const STATUS_ICONS  = { open: '○', 'in-progress': '◐', done: '✓' };
@@ -29,6 +94,10 @@ const PROJECT_COLORS = [
 let state = {};
 let timerInterval = null;
 let panelActiveTab = 'details'; // 'details' | 'log'
+let bulkMode = false;
+let bulkSelected = []; // [{cid, pid, tid}]
+let bulkVisibleItems = []; // [{cid, pid, tid}] — updated each render
+let _aiTaskDescription = null; // set by quickAddWithAI before modal
 
 function defaultState() {
   return {
@@ -51,6 +120,7 @@ function defaultState() {
       clockify:  { enabled: true,  apiKey: '', workspaceId: CLOCKIFY_WORKSPACE, userId: CLOCKIFY_USER_ID },
       greenapi:  { enabled: false, instanceId: '', token: '' },
       accounting:{ enabled: false, provider: '', apiKey: '' },
+      claude:    { apiKey: '' },
     },
     filters: {
       status: STATUS.OPEN,
@@ -63,49 +133,112 @@ function defaultState() {
 }
 
 function loadState() {
+  const BACKUP_KEY = STORAGE_KEY + '_backup';
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const saved = JSON.parse(raw);
-      const def = defaultState();
-      state = Object.assign(def, saved);
-      // Deep-merge nested objects that Object.assign would overwrite entirely
-      state.business     = Object.assign(def.business,     saved.business     || {});
-      state.integrations = Object.assign(def.integrations, saved.integrations || {});
-      state.integrations.clockify   = Object.assign(def.integrations.clockify,   (saved.integrations||{}).clockify   || {});
-      state.integrations.greenapi   = Object.assign(def.integrations.greenapi,   (saved.integrations||{}).greenapi   || {});
-      state.integrations.accounting = Object.assign(def.integrations.accounting, (saved.integrations||{}).accounting || {});
-      // Migrate old top-level clockifyApiKey → integrations.clockify.apiKey
-      if (saved.clockifyApiKey && !state.integrations.clockify.apiKey) {
-        state.integrations.clockify.apiKey = saved.clockifyApiKey;
-      }
-      if (!state.clockifyApiKey) state.clockifyApiKey = def.clockifyApiKey;
-      // Migrate old reportMonth → reportRange
-      if (state.reportMonth && !state.reportRange) {
+    if (!raw) { state = defaultState(); return; }
+
+    const saved = JSON.parse(raw);
+
+    // Always save a backup before any processing (overwrite only if clients exist)
+    if (saved.clients && saved.clients.length > 0) {
+      localStorage.setItem(BACKUP_KEY, raw);
+    }
+
+    const def = defaultState();
+    state = Object.assign(def, saved);
+
+    // Deep-merge nested objects — each wrapped in its own try so one failure can't wipe all data
+    try { state.business = Object.assign(def.business, saved.business || {}); } catch(e) {}
+    try {
+      const si = saved.integrations || {};
+      const di = def.integrations   || {};
+      state.integrations            = Object.assign(di, si);
+      state.integrations.clockify   = Object.assign({}, di.clockify   || {}, si.clockify   || {});
+      state.integrations.greenapi   = Object.assign({}, di.greenapi   || {}, si.greenapi   || {});
+      state.integrations.accounting = Object.assign({}, di.accounting || {}, si.accounting || {});
+      state.integrations.claude     = Object.assign({}, { apiKey: '' },      si.claude     || {});
+    } catch(e) { state.integrations = def.integrations; }
+
+    // Ensure clients are always preserved
+    if (!state.clients) state.clients = saved.clients || [];
+
+    // Migrate old top-level clockifyApiKey → integrations.clockify.apiKey
+    if (saved.clockifyApiKey && !state.integrations.clockify.apiKey) {
+      state.integrations.clockify.apiKey = saved.clockifyApiKey;
+    }
+    if (!state.clockifyApiKey) state.clockifyApiKey = def.clockifyApiKey;
+
+    // Migrate old reportMonth → reportRange
+    if (state.reportMonth && !state.reportRange) {
+      try {
         const [y, m] = state.reportMonth.split('-').map(Number);
         const from = `${y}-${String(m).padStart(2,'0')}-01`;
         const to   = new Date(y, m, 0).toISOString().split('T')[0];
         state.reportRange = { mode: 'monthly', from, to };
         delete state.reportMonth;
-      }
-      // Migrate stored 'in-progress' → 'open' (in-progress is now derived, not stored)
-      for (const c of (state.clients || [])) {
-        for (const p of (c.projects || [])) {
-          for (const t of (p.tasks || [])) {
-            if (t.status === STATUS.IN_PROGRESS) t.status = STATUS.OPEN;
-          }
+      } catch(e) {}
+    }
+
+    // Migrate stored 'in-progress' → 'open'
+    for (const c of (state.clients || [])) {
+      for (const p of (c.projects || [])) {
+        for (const t of (p.tasks || [])) {
+          if (t.status === STATUS.IN_PROGRESS) t.status = STATUS.OPEN;
         }
       }
-    } else {
-      state = defaultState();
     }
+
+    // Migrate: clear old clockify shared report IDs
+    if (!state._clockifyReportV2) {
+      for (const c of (state.clients || [])) {
+        delete c.clockifySharedReportId;
+        for (const p of (c.projects || [])) { delete p.clockifySharedReportId; }
+      }
+      state._clockifyReportV2 = true;
+    }
+
   } catch (e) {
+    console.error('loadState failed, attempting backup restore:', e);
+    // Try to restore from backup before giving up
+    try {
+      const backup = localStorage.getItem(BACKUP_KEY);
+      if (backup) {
+        const saved = JSON.parse(backup);
+        state = Object.assign(defaultState(), saved);
+        state.clients = saved.clients || [];
+        console.warn('Restored from backup. Clients:', state.clients.length);
+        return;
+      }
+    } catch(e2) {}
     state = defaultState();
   }
 }
 
+function recoverFromBackup() {
+  const BACKUP_KEY = STORAGE_KEY + '_backup';
+  const backup = localStorage.getItem(BACKUP_KEY);
+  if (!backup) { showToast('לא נמצא גיבוי', 'error'); return; }
+  try {
+    const saved = JSON.parse(backup);
+    if (!saved.clients || saved.clients.length === 0) { showToast('הגיבוי ריק', 'error'); return; }
+    localStorage.setItem(STORAGE_KEY, backup);
+    loadState();
+    render();
+    showToast(`שוחזרו ${saved.clients.length} לקוחות מגיבוי ✓`, 'success');
+  } catch(e) {
+    showToast('שגיאה בשחזור גיבוי', 'error');
+  }
+}
+
 function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  const data = JSON.stringify(state);
+  localStorage.setItem(STORAGE_KEY, data);
+  // Always keep a rolling backup — saved only when there is real data
+  if (state.clients && state.clients.length > 0) {
+    localStorage.setItem(STORAGE_KEY + '_backup', data);
+  }
+  saveToSupabase();
 }
 
 // ============================================================
@@ -180,6 +313,18 @@ function esc(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function linkify(text) {
+  if (!text) return '';
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const parts = text.split(urlRegex);
+  return parts.map((part, i) => {
+    if (i % 2 === 1) {
+      return `<a href="${esc(part)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${esc(part)}</a>`;
+    }
+    return esc(part).replace(/\n/g, '<br>');
+  }).join('');
 }
 
 // ============================================================
@@ -451,6 +596,7 @@ function startTimer(cid, pid, tid, sid = null) {
       clientId:    cid,
       projectId:   pid,
       taskName:    s ? s.title : (t?.title || ''),
+      taskId:      s ? null : tid,
       description: s ? (s.description || '') : (t?.description || ''),
       billable:    p?.billable || false,
       startTime
@@ -544,6 +690,7 @@ function stopTimer() {
           clientName:  c?.name || '', projectName: p?.name || '',
           clientId:    at.clientId, projectId:   at.projectId,
           taskName:    s ? s.title : (t?.title || ''),
+          taskId:      s ? null : at.taskId,
           description: s ? (s.description || '') : (t?.description || ''),
           billable:    p?.billable || false, start: at.startTime, end: endTime
         });
@@ -591,26 +738,30 @@ function tickTimer() {
 // CLOCKIFY
 // ============================================================
 
-// Shared: resolve projectId (find or create client + project)
-async function clockifyResolveProject(apiKey, wsId, clientName, projectName, localClientId, localProjectId) {
+// Shared: resolve projectId + taskId (find or create client / project / task)
+async function clockifyResolveProject(apiKey, wsId, clientName, projectName, localClientId, localProjectId, taskName, localTaskId) {
   let clockifyClientId  = clientName  ? await clockifyUpsertClient(apiKey, wsId, clientName, localClientId)  : null;
   let clockifyProjectId = projectName ? await clockifyUpsertProject(apiKey, wsId, projectName, clockifyClientId, localClientId, localProjectId) : null;
   if (!clockifyProjectId) throw new Error(`לא ניתן למצוא/ליצור פרויקט "${projectName}" ב-Clockify`);
-  return clockifyProjectId;
+  let clockifyTaskId = taskName && clockifyProjectId
+    ? await clockifyUpsertTask(apiKey, wsId, clockifyProjectId, taskName, localClientId, localProjectId, localTaskId)
+    : null;
+  return { projectId: clockifyProjectId, taskId: clockifyTaskId };
 }
 
 // Called on ▶ — opens a live running entry, returns entry ID
-async function clockifyStartEntry({ clientName, projectName, clientId, projectId: localProjectId, taskName, description, billable, startTime }) {
+async function clockifyStartEntry({ clientName, projectName, clientId, projectId: localProjectId, taskName, taskId: localTaskId, description, billable, startTime }) {
   const apiKey = state.clockifyApiKey;
   const wsId   = CLOCKIFY_WORKSPACE;
   try {
-    const projectId = await clockifyResolveProject(apiKey, wsId, clientName, projectName, clientId, localProjectId);
+    const { projectId, taskId } = await clockifyResolveProject(apiKey, wsId, clientName, projectName, clientId, localProjectId, taskName, localTaskId);
     const body = {
       start: new Date(startTime).toISOString(),
-      description: taskName + (description ? ': ' + description : ''),
+      description: description || '',
       projectId,
       billable: billable || false
     };
+    if (taskId) body.taskId = taskId;
     const res = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/time-entries`, {
       method: 'POST',
       headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
@@ -646,18 +797,19 @@ async function clockifyStopEntry(entryId, endTime) {
 }
 
 // Fallback: create a completed entry (used if stop is called before start resolved)
-async function clockifyCreateEntry({ clientName, projectName, clientId, projectId: localProjectId, taskName, description, billable, start, end }) {
+async function clockifyCreateEntry({ clientName, projectName, clientId, projectId: localProjectId, taskName, taskId: localTaskId, description, billable, start, end }) {
   const apiKey = state.clockifyApiKey;
   const wsId   = CLOCKIFY_WORKSPACE;
   try {
-    const projectId = await clockifyResolveProject(apiKey, wsId, clientName, projectName, clientId, localProjectId);
+    const { projectId, taskId } = await clockifyResolveProject(apiKey, wsId, clientName, projectName, clientId, localProjectId, taskName, localTaskId);
     const body = {
       start: new Date(start).toISOString(),
       end:   new Date(end).toISOString(),
-      description: taskName + (description ? ': ' + description : ''),
+      description: description || '',
       projectId,
       billable: billable || false
     };
+    if (taskId) body.taskId = taskId;
     const res = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/time-entries`, {
       method: 'POST',
       headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
@@ -712,10 +864,11 @@ async function clockifyUpsertProject(apiKey, wsId, name, clockifyClientId, local
   }
   try {
     let id = null;
-    const r = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/projects?name=${encodeURIComponent(name)}&page-size=50`, { headers: { 'X-Api-Key': apiKey } });
+    const normName = name.replace(/\s+/g, ' ').trim();
+    const r = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/projects?name=${encodeURIComponent(normName)}&page-size=50`, { headers: { 'X-Api-Key': apiKey } });
     if (r.ok) {
       const list = await r.json();
-      const found = list.find(x => x.name.toLowerCase() === name.toLowerCase());
+      const found = list.find(x => x.name.replace(/\s+/g, ' ').trim().toLowerCase() === normName.toLowerCase());
       if (found) id = found.id;
     }
     if (!id) {
@@ -727,7 +880,20 @@ async function clockifyUpsertProject(apiKey, wsId, name, clockifyClientId, local
         body: JSON.stringify(body)
       });
       if (cr.ok) { const x = await cr.json(); id = x.id; }
-      else console.warn('Clockify create project failed:', cr.status, await cr.text());
+      else {
+        const errText = await cr.text();
+        // Project already exists (Clockify returns 400 + code 501) — fetch it by listing all
+        if (cr.status === 400) {
+          const norm = s => s.replace(/\s+/g, ' ').trim().toLowerCase();
+          const allR = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/projects?page-size=500`, { headers: { 'X-Api-Key': apiKey } });
+          if (allR.ok) {
+            const all = await allR.json();
+            const found = all.find(x => norm(x.name) === norm(name));
+            if (found) id = found.id;
+          }
+        }
+        if (!id) console.warn('Clockify create project failed:', cr.status, errText);
+      }
     }
     // Persist ID so future calls skip the API lookup
     if (id && localClientId && localProjectId) {
@@ -737,6 +903,152 @@ async function clockifyUpsertProject(apiKey, wsId, name, clockifyClientId, local
     return id;
   } catch (e) { console.warn('clockifyUpsertProject:', e); }
   return null;
+}
+
+async function clockifyUpsertTask(apiKey, wsId, projectId, taskName, localClientId, localProjectId, localTaskId) {
+  if (!taskName) return null;
+  // Use cached Clockify task ID if available
+  if (localClientId && localProjectId && localTaskId) {
+    const localTask = getTask(localClientId, localProjectId, localTaskId);
+    if (localTask?.clockifyTaskId) return localTask.clockifyTaskId;
+  }
+  try {
+    const norm = s => s.replace(/\s+/g, ' ').trim().toLowerCase();
+    const r = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/projects/${projectId}/tasks?page-size=100`, { headers: { 'X-Api-Key': apiKey } });
+    if (r.ok) {
+      const list = await r.json();
+      const found = list.find(x => norm(x.name) === norm(taskName));
+      if (found) {
+        if (localClientId && localProjectId && localTaskId) {
+          const localTask = getTask(localClientId, localProjectId, localTaskId);
+          if (localTask) { localTask.clockifyTaskId = found.id; saveState(); }
+        }
+        return found.id;
+      }
+    }
+    const cr = await fetch(`https://api.clockify.me/api/v1/workspaces/${wsId}/projects/${projectId}/tasks`, {
+      method: 'POST',
+      headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: taskName.replace(/\s+/g, ' ').trim(), status: 'ACTIVE' })
+    });
+    if (cr.ok) {
+      const t = await cr.json();
+      if (localClientId && localProjectId && localTaskId) {
+        const localTask = getTask(localClientId, localProjectId, localTaskId);
+        if (localTask) { localTask.clockifyTaskId = t.id; saveState(); }
+      }
+      return t.id;
+    }
+    console.warn('Clockify create task failed:', cr.status, await cr.text());
+  } catch (e) { console.warn('clockifyUpsertTask:', e); }
+  return null;
+}
+
+async function clockifyGetExistingReportNames(apiKey, wsId) {
+  try {
+    const res = await fetch(`https://reports.api.clockify.me/v1/workspaces/${wsId}/shared-reports?page-size=200`, {
+      headers: { 'X-Api-Key': apiKey }
+    });
+    if (!res.ok) return [];
+    const raw  = await res.json();
+    const list = Array.isArray(raw) ? raw : (raw.data || raw.reports || []);
+    return list.map(r => (r.name || '').toLowerCase());
+  } catch { return []; }
+}
+
+async function clockifyCreateSharedReport(filterType, clockifyEntityId, name) {
+  const apiKey = state.clockifyApiKey;
+  const wsId   = CLOCKIFY_WORKSPACE;
+  // Build unique name: append suffix if already taken
+  const existing = await clockifyGetExistingReportNames(apiKey, wsId);
+  let uniqueName = name;
+  if (existing.includes(name.toLowerCase())) {
+    let i = 1;
+    while (existing.includes(`${name} ${i}`.toLowerCase())) i++;
+    uniqueName = `${name} ${i}`;
+  }
+  const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth();
+  const filter = {
+    dateRangeType: 'THIS_MONTH',
+    dateRangeStart: new Date(y, m, 1).toISOString(),
+    dateRangeEnd:   new Date(y, m + 1, 0, 23, 59, 59, 999).toISOString(),
+    detailedFilter: { options: { totals: 'CALCULATE' } },
+  };
+  if (filterType === 'project') {
+    filter.projects = { contains: 'CONTAINS', ids: [clockifyEntityId], status: 'ALL' };
+  } else {
+    filter.clients = { contains: 'CONTAINS', ids: [clockifyEntityId], status: 'ALL' };
+  }
+  const res = await fetch(`https://reports.api.clockify.me/v1/workspaces/${wsId}/shared-reports`, {
+    method: 'POST',
+    headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: uniqueName, type: 'DETAILED', isPublic: true, fixedDate: false, filter })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text()}`);
+  const data = await res.json();
+  return data.id;
+}
+
+async function openClientSharedReport(cid) {
+  const c = getClient(cid);
+  if (!c) return;
+  const apiKey = state.clockifyApiKey;
+  if (!apiKey) { showToast('יש להגדיר מפתח API של Clockify תחילה', 'error'); return; }
+  if (c.clockifySharedReportId) {
+    window.open(`https://app.clockify.me/shared/${c.clockifySharedReportId}`, '_blank');
+    return;
+  }
+  showToast('יוצר דוח שיתופי ב-Clockify...', 'info');
+  try {
+    if (!c.clockifyId) {
+      c.clockifyId = await clockifyUpsertClient(apiKey, CLOCKIFY_WORKSPACE, c.name, cid);
+      saveState();
+    }
+    if (!c.clockifyId) { showToast('לא ניתן לסנכרן לקוח עם Clockify', 'error'); return; }
+    const reportId = await clockifyCreateSharedReport('client', c.clockifyId, c.name);
+    c.clockifySharedReportId = reportId;
+    saveState();
+    render();
+    window.open(`https://app.clockify.me/shared/${reportId}`, '_blank');
+    showToast('דוח שיתופי נוצר בהצלחה ✓', 'success');
+  } catch (e) {
+    console.error('openClientSharedReport:', e);
+    showToast('שגיאה ביצירת דוח: ' + e.message, 'error');
+  }
+}
+
+async function openProjectSharedReport(cid, pid) {
+  const c = getClient(cid);
+  const p = getProject(cid, pid);
+  if (!p || !c) return;
+  const apiKey = state.clockifyApiKey;
+  if (!apiKey) { showToast('יש להגדיר מפתח API של Clockify תחילה', 'error'); return; }
+  if (p.clockifySharedReportId) {
+    window.open(`https://app.clockify.me/shared/${p.clockifySharedReportId}`, '_blank');
+    return;
+  }
+  showToast('יוצר דוח שיתופי ב-Clockify...', 'info');
+  try {
+    if (!c.clockifyId) {
+      c.clockifyId = await clockifyUpsertClient(apiKey, CLOCKIFY_WORKSPACE, c.name, cid);
+      if (c.clockifyId) saveState();
+    }
+    if (!p.clockifyId) {
+      p.clockifyId = await clockifyUpsertProject(apiKey, CLOCKIFY_WORKSPACE, p.name, c.clockifyId, cid, pid);
+      if (p.clockifyId) saveState();
+    }
+    if (!p.clockifyId) { showToast('לא ניתן לסנכרן פרויקט עם Clockify', 'error'); return; }
+    const reportId = await clockifyCreateSharedReport('project', p.clockifyId, `${c.name} - ${p.name}`);
+    p.clockifySharedReportId = reportId;
+    saveState();
+    render();
+    window.open(`https://app.clockify.me/shared/${reportId}`, '_blank');
+    showToast('דוח שיתופי נוצר בהצלחה ✓', 'success');
+  } catch (e) {
+    console.error('openProjectSharedReport:', e);
+    showToast('שגיאה ביצירת דוח: ' + e.message, 'error');
+  }
 }
 
 // ============================================================
@@ -810,17 +1122,127 @@ function applyTodayFilters(items) {
 }
 
 // ============================================================
+// BULK SELECTION
+// ============================================================
+function toggleBulkMode() {
+  bulkMode = !bulkMode;
+  bulkSelected = [];
+  bulkVisibleItems = [];
+  render();
+}
+
+function toggleBulkSelect(cid, pid, tid) {
+  const idx = bulkSelected.findIndex(s => s.tid === tid);
+  if (idx === -1) bulkSelected.push({ cid, pid, tid });
+  else bulkSelected.splice(idx, 1);
+  render();
+}
+
+function bulkSelectAll() {
+  const allSelected = bulkVisibleItems.length > 0 &&
+    bulkVisibleItems.every(item => bulkSelected.some(s => s.tid === item.tid));
+  if (allSelected) {
+    bulkSelected = [];
+  } else {
+    bulkSelected = [...bulkVisibleItems];
+  }
+  render();
+}
+
+function renderBulkBar() {
+  if (!bulkMode) return '';
+  const count = bulkSelected.length;
+  const allSelected = bulkVisibleItems.length > 0 &&
+    bulkVisibleItems.every(item => bulkSelected.some(s => s.tid === item.tid));
+  const dis = count === 0 ? 'disabled' : '';
+  return `<div class="bulk-bar">
+    <button class="btn btn-ghost btn-sm" onclick="toggleBulkMode()">✕ ביטול</button>
+    <button class="btn btn-ghost btn-sm" onclick="bulkSelectAll()">${allSelected ? 'בטל הכל' : 'בחר הכל'}</button>
+    <span class="bulk-count">${count > 0 ? count + ' נבחרו' : 'לא נבחרו'}</span>
+    <div class="bulk-bar-sep"></div>
+    <button class="btn btn-ghost btn-sm" ${dis} onclick="bulkSetStatus('done')">✓ סמן הושלם</button>
+    <button class="btn btn-ghost btn-sm" ${dis} onclick="bulkSetStatus('open')">○ סמן פתוח</button>
+    <div class="bulk-bar-sep"></div>
+    <button class="btn btn-ghost btn-sm" ${dis} onclick="bulkSetPriority('high')">🔴 גבוה</button>
+    <button class="btn btn-ghost btn-sm" ${dis} onclick="bulkSetPriority('medium')">🟡 בינוני</button>
+    <button class="btn btn-ghost btn-sm" ${dis} onclick="bulkSetPriority('low')">🟢 נמוך</button>
+    <div class="bulk-bar-sep"></div>
+    <button class="btn btn-ghost btn-sm btn-danger" ${dis} onclick="bulkDelete()">🗑 מחק</button>
+  </div>`;
+}
+
+function bulkSetStatus(newStatus) {
+  if (bulkSelected.length === 0) return;
+  const now = Date.now();
+  for (const { cid, pid, tid } of bulkSelected) {
+    const t = getTask(cid, pid, tid);
+    if (!t) continue;
+    if (newStatus === STATUS.DONE && state.activeTimer?.taskId === tid) stopTimer();
+    t.status = newStatus;
+    t.completedAt = newStatus === STATUS.DONE ? now : null;
+    (t.activityLog = t.activityLog || []).push({ type: newStatus === STATUS.DONE ? 'done' : 'reopened', timestamp: now });
+  }
+  saveState();
+  bulkSelected = [];
+  bulkMode = false;
+  render();
+  showToast(`סטטוס עודכן ✓`, 'success');
+}
+
+function bulkSetPriority(priority) {
+  if (bulkSelected.length === 0) return;
+  for (const { cid, pid, tid } of bulkSelected) {
+    const t = getTask(cid, pid, tid);
+    if (t) t.priority = priority;
+  }
+  saveState();
+  bulkSelected = [];
+  bulkMode = false;
+  render();
+  showToast(`עדיפות עודכנה ✓`, 'success');
+}
+
+function bulkDelete() {
+  if (bulkSelected.length === 0) return;
+  const count = bulkSelected.length;
+  if (!confirm(`למחוק ${count} משימות?`)) return;
+  for (const { cid, pid, tid } of bulkSelected) {
+    deleteTask(cid, pid, tid);
+  }
+  saveState();
+  bulkSelected = [];
+  bulkMode = false;
+  render();
+  showToast(`${count} משימות נמחקו`, 'info');
+}
+
+// ============================================================
 // NAVIGATION
 // ============================================================
 function resetViewFilters() {
   state.filters.status = STATUS.OPEN;
   state.selectedTaskId = null; state.panelClientId = null; state.panelProjectId = null;
+  bulkMode = false; bulkSelected = []; bulkVisibleItems = [];
 }
 
 function navigateTo(view) {
   resetViewFilters();
   state.currentView = view;
+  if (['reports','report','clockify-reports','daily-production','daily-local'].includes(view)) {
+    state._reportsNavOpen = true;
+  }
   saveState(); render();
+}
+
+function goReports() {
+  state._reportsNavOpen = true;
+  navigateTo('reports');
+}
+
+function goReportSection(key) {
+  state.reportsSection = key;
+  state._reportsNavOpen = true;
+  navigateTo('reports');
 }
 
 function selectClient(cid) {
@@ -931,30 +1353,38 @@ function render() {
   if (state.activeTimer && !timerInterval) startTimerTick();
 }
 
+function toggleSidebar() {
+  state._sidebarCollapsed = !state._sidebarCollapsed;
+  renderSidebar();
+}
+
 function renderSidebar() {
   const nav = document.getElementById('sidebar-nav');
   if (!nav) return;
-  const isToday = state.currentView === 'today';
+  const v          = state.currentView;
+  const collapsed  = !!state._sidebarCollapsed;
+  const sidebar    = document.getElementById('sidebar');
+  if (sidebar) sidebar.classList.toggle('sidebar-collapsed', collapsed);
 
-  const isReport = state.currentView === 'report';
   let html = `
-    <div class="nav-today ${isToday ? 'active' : ''}" onclick="navigateTo('today')">
-      <span class="nav-today-icon">📅</span>
-      <span>היום</span>
+    <div class="sb-toggle-row">
+      <button class="sb-toggle-btn" onclick="toggleSidebar()" title="${collapsed ? 'הרחב' : 'כווץ'}">
+        ${collapsed ? '‹' : '›'}
+      </button>
     </div>
-    <div class="nav-today ${isReport ? 'active' : ''}" onclick="navigateTo('report')">
-      <span class="nav-today-icon">📊</span>
-      <span>דוח שעות</span>
+    <div class="nav-today ${v === 'today' ? 'active' : ''}" onclick="navigateTo('today')" title="היום">
+      <span class="nav-today-icon">📅</span>
+      <span class="sb-label">היום</span>
     </div>`;
 
   for (const c of state.clients) {
     if (c.archived) continue;
     const active = state.selectedClientId === c.id;
-    html += `<div class="nav-client ${active ? 'active' : ''}">
+    html += `<div class="nav-client ${active ? 'active' : ''}" title="${esc(c.name)}">
       <div class="nav-client-header" onclick="selectClient('${c.id}')">
         <span style="font-size:15px">👤</span>
-        <span class="nav-client-name">${esc(c.name)}</span>
-        <span class="nav-chevron">›</span>
+        <span class="nav-client-name sb-label">${esc(c.name)}</span>
+        <span class="nav-chevron sb-label">›</span>
       </div>
       ${renderSidebarProjects(c)}
     </div>`;
@@ -963,12 +1393,21 @@ function renderSidebar() {
   const hasArchived = state.clients.some(c => c.archived || (c.projects||[]).some(p => p.archived));
   const isArchive = state.currentView === 'archive';
   if (hasArchived) {
-    html += `<div class="nav-today ${isArchive ? 'active' : ''}" onclick="navigateTo('archive')" style="margin-top:8px;opacity:0.7">
+    html += `<div class="nav-today ${isArchive ? 'active' : ''}" onclick="navigateTo('archive')" style="margin-top:8px;opacity:0.7" title="ארכיון">
       <span class="nav-today-icon">📦</span>
-      <span>ארכיון</span>
+      <span class="sb-label">ארכיון</span>
     </div>`;
   }
+
   nav.innerHTML = html;
+
+  // Highlight footer buttons based on current view
+  const reportViews = ['reports','report','clockify-reports','daily-production','daily-local'];
+  document.querySelectorAll('.settings-footer-btn').forEach(btn => {
+    const isReports  = btn.getAttribute('onclick')?.includes('goReports');
+    const isSettings = btn.getAttribute('onclick')?.includes("'settings'");
+    btn.classList.toggle('active', isReports ? reportViews.includes(v) : isSettings ? v === 'settings' : false);
+  });
 }
 
 function renderSidebarProjects(client) {
@@ -989,14 +1428,23 @@ function renderSidebarProjects(client) {
 function renderMain() {
   const el = document.getElementById('main-content');
   if (!el) return;
-  switch (state.currentView) {
-    case 'today':   el.innerHTML = renderTodayView();   break;
-    case 'client':  el.innerHTML = renderClientView();  break;
-    case 'project': el.innerHTML = renderProjectView(); break;
-    case 'report':  el.innerHTML = renderReportView();  break;
-    case 'archive':   el.innerHTML = renderArchiveView();   break;
-    case 'settings':  el.innerHTML = renderSettingsView();  break;
-    default:          el.innerHTML = renderTodayView();
+  try {
+    switch (state.currentView) {
+      case 'today':   el.innerHTML = renderTodayView();   break;
+      case 'client':  el.innerHTML = renderClientView();  break;
+      case 'project': el.innerHTML = renderProjectView(); break;
+      case 'reports':           el.innerHTML = renderReportsHub();           break;
+      case 'report':            el.innerHTML = renderReportView();           break;
+      case 'clockify-reports':  el.innerHTML = renderClockifyReportsView();  break;
+      case 'daily-production':  el.innerHTML = renderDailyProductionView();  break;
+      case 'daily-local':       el.innerHTML = renderDailyLocalView();       break;
+      case 'archive':           el.innerHTML = renderArchiveView();          break;
+      case 'settings':          el.innerHTML = renderSettingsView();         break;
+      default:          el.innerHTML = renderTodayView();
+    }
+  } catch(err) {
+    console.error('renderMain error:', err);
+    el.innerHTML = `<div class="view-container"><div class="empty-state" style="color:red">שגיאת רינדור: ${esc(String(err))}</div></div>`;
   }
 }
 
@@ -1019,6 +1467,8 @@ function renderTodayView() {
     }
   }
 
+  bulkVisibleItems = items.map(({ client, project, task }) => ({ cid: client.id, pid: project.id, tid: task.id }));
+
   const clientOpts = [
     { value: 'all', label: 'כל הלקוחות' },
     ...state.clients.filter(c => !c.archived).map(c => ({ value: c.id, label: c.name }))
@@ -1029,12 +1479,16 @@ function renderTodayView() {
       <div class="view-header-title">
         <h2>📅 היום <span class="today-date">${d}/${m}/${y}</span></h2>
       </div>
+      <div class="view-actions">
+        <button class="btn ${bulkMode ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="toggleBulkMode()" title="בחירה מרובה">☑ בחירה</button>
+      </div>
     </div>
     <div class="filter-bar">
       <span class="filter-label">פילטר:</span>
       ${renderFilterSelects(tags)}
       ${renderCsel('f-client', clientOpts, state.filters.clientId || 'all', "setFilter('clientId',{val})")}
     </div>
+    ${renderBulkBar()}
     ${renderQuickAddBar()}
     <div class="task-list">${tasksHtml}</div>
   </div>`;
@@ -1596,6 +2050,7 @@ function renderClientView() {
     <div class="view-header">
       <h2>👤 ${esc(c.name)}</h2>
       <div class="view-actions">
+        <button class="btn btn-ghost btn-sm" onclick="openClientSharedReport('${c.id}')" title="${c.clockifySharedReportId ? 'פתח דוח Clockify' : 'צור דוח שיתופי ב-Clockify'}">📊 ${c.clockifySharedReportId ? 'דוח Clockify' : 'צור דוח'}</button>
         <button class="btn btn-ghost btn-sm" onclick="showEditClientModal('${c.id}')">✏️ עריכה</button>
         <button class="btn btn-ghost btn-sm" onclick="archiveClient('${c.id}')" title="העבר לארכיון">📦 ארכיון</button>
         <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteClient('${c.id}')">🗑️ מחיקה</button>
@@ -1663,6 +2118,7 @@ function renderProjectCard(cid, p, isArchivedView = false) {
            <button class="btn-icon danger" onclick="confirmDeleteProject('${cid}','${p.id}')" title="מחיקה">🗑️</button>`
         : `${isInbox ? `<button class="btn-icon" onclick="showAssignClientModal('${cid}','${p.id}')" title="שייך ללקוח">🔗</button>` : ''}
            ${(() => { const at = state.activeTimer; const isPlanning = at && at.type === 'planning' && at.projectId === p.id; return `<button class="btn-icon ${isPlanning ? 'running' : ''}" onclick="${isPlanning ? 'stopTimer()' : `startProjectPlanningTimer('${cid}','${p.id}')`}" title="אפיון ותכנון">${isPlanning ? '⏸' : '⏱'}</button>`; })()}
+           <button class="btn-icon" onclick="openProjectSharedReport('${cid}','${p.id}')" title="${p.clockifySharedReportId ? 'פתח דוח Clockify' : 'צור דוח Clockify'}">📊</button>
            <button class="btn-icon" onclick="showEditProjectModal('${cid}','${p.id}')" title="עריכה">✏️</button>
            <button class="btn-icon" onclick="archiveProject('${cid}','${p.id}')" title="ארכיון">📦</button>
            <button class="btn-icon danger" onclick="confirmDeleteProject('${cid}','${p.id}')" title="מחיקה">🗑️</button>`
@@ -1696,6 +2152,8 @@ function renderProjectView() {
       ${p.hourlyRate > 0 ? `<span class="time-label">(${formatMoney(p.hourlyRate)}/ש')</span>` : ''}
     </div>` : '';
 
+  bulkVisibleItems = filtered.map(t => ({ cid: c.id, pid: p.id, tid: t.id }));
+
   const tasksHtml = filtered.length === 0
     ? `<div class="empty-state"><div class="empty-icon">✓</div><div>אין משימות מתאימות</div></div>`
     : filtered.map(t => renderTaskCard(t, c.id, p.id, {})).join('');
@@ -1711,6 +2169,8 @@ function renderProjectView() {
       </div>
       <div class="view-actions">
         ${(() => { const at = state.activeTimer; const isPlanning = at && at.type === 'planning' && at.projectId === p.id; return `<button class="btn ${isPlanning ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="${isPlanning ? 'stopTimer()' : `startProjectPlanningTimer('${c.id}','${p.id}')`}" title="אפיון ותכנון">${isPlanning ? '⏸ עצור' : '⏱ אפיון ותכנון'}</button>`; })()}
+        <button class="btn btn-ghost btn-sm" onclick="openProjectSharedReport('${c.id}','${p.id}')" title="${p.clockifySharedReportId ? 'פתח דוח Clockify' : 'צור דוח שיתופי ב-Clockify'}">📊 ${p.clockifySharedReportId ? 'דוח Clockify' : 'צור דוח'}</button>
+        <button class="btn ${bulkMode ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="toggleBulkMode()" title="בחירה מרובה">☑ בחירה</button>
         <button class="btn btn-ghost btn-sm" onclick="showEditProjectModal('${c.id}','${p.id}')">✏️</button>
         <button class="btn btn-ghost btn-sm" onclick="archiveProject('${c.id}','${p.id}')" title="העבר לארכיון">📦</button>
         <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteProject('${c.id}','${p.id}')">🗑️</button>
@@ -1722,6 +2182,7 @@ function renderProjectView() {
       <span class="filter-label">פילטר:</span>
       ${renderFilterSelects(tags)}
     </div>
+    ${renderBulkBar()}
     ${renderQuickAddBar()}
     <div class="task-list">${tasksHtml}</div>
   </div>`;
@@ -1771,14 +2232,18 @@ function renderTaskCard(task, cid, pid, opts) {
 
   const tickAttrs = isRunning ? `data-tick data-base="${task.timeTotal || 0}"` : '';
 
-  const draggable = state.filters.sortBy === 'manual';
+  const draggable = !bulkMode && state.filters.sortBy === 'manual';
   const effStatus = effectiveStatus(task);
-  return `<div class="task-card ${selected ? 'selected' : ''} ${effStatus === STATUS.DONE ? 'task-done' : ''}"
+  const isBulkChecked = bulkMode && bulkSelected.some(s => s.tid === task.id);
+  return `<div class="task-card ${selected ? 'selected' : ''} ${effStatus === STATUS.DONE ? 'task-done' : ''} ${bulkMode ? 'bulk-mode' : ''} ${isBulkChecked ? 'bulk-checked' : ''}"
       ${draggable ? `draggable="true" data-task-id="${task.id}" data-client-id="${cid}" data-project-id="${pid}"` : ''}
-      onclick="selectTask('${cid}','${pid}','${task.id}')">
-    <button class="status-btn status-${effStatus}"
-      onclick="event.stopPropagation();cycleStatus('${cid}','${pid}','${task.id}')"
-      title="${STATUS_LABELS[effStatus]}">${effStatus === STATUS.DONE ? '✓' : effStatus === STATUS.IN_PROGRESS ? '◐' : ''}</button>
+      onclick="${bulkMode ? `toggleBulkSelect('${cid}','${pid}','${task.id}')` : `selectTask('${cid}','${pid}','${task.id}')`}">
+    ${bulkMode
+      ? `<div class="bulk-checkbox">${isBulkChecked ? '✓' : ''}</div>`
+      : `<button class="status-btn status-${effStatus}"
+          onclick="event.stopPropagation();cycleStatus('${cid}','${pid}','${task.id}')"
+          title="${STATUS_LABELS[effStatus]}">${effStatus === STATUS.DONE ? '✓' : effStatus === STATUS.IN_PROGRESS ? '◐' : ''}</button>`
+    }
     <div class="task-card-body">
       <div class="task-card-row1">
         <span class="task-title ${effStatus === STATUS.DONE ? 'done' : ''}">${esc(task.title)}</span>
@@ -1957,8 +2422,11 @@ function buildTaskPanel(task, cid, pid) {
       <!-- Description -->
       <div class="panel-field-block">
         <label>תיאור</label>
-        <textarea class="panel-desc" placeholder="תיאור המשימה..."
-          onblur="saveTaskField('${cid}','${pid}','${task.id}','description',this.value)"
+        <div class="panel-desc-preview${task.description ? '' : ' empty'}"
+          onclick="startEditDesc(this)"
+        >${task.description ? linkify(task.description) : '<span class="placeholder">תיאור המשימה...</span>'}</div>
+        <textarea class="panel-desc" style="display:none"
+          onblur="finishEditDesc(this,'${cid}','${pid}','${task.id}')"
         >${esc(task.description||'')}</textarea>
       </div>
 
@@ -2082,6 +2550,27 @@ function saveTaskField(cid, pid, tid, field, value, rerenderPanel = false) {
   updateTask(cid, pid, tid, { [field]: value });
   renderSidebar();
   if (rerenderPanel) renderTaskPanel();
+}
+
+function startEditDesc(previewEl) {
+  const textarea = previewEl.nextElementSibling;
+  previewEl.style.display = 'none';
+  textarea.style.display = '';
+  textarea.focus();
+}
+
+function finishEditDesc(textarea, cid, pid, tid) {
+  saveTaskField(cid, pid, tid, 'description', textarea.value);
+  const preview = textarea.previousElementSibling;
+  if (textarea.value) {
+    preview.innerHTML = linkify(textarea.value);
+    preview.classList.remove('empty');
+  } else {
+    preview.innerHTML = '<span class="placeholder">תיאור המשימה...</span>';
+    preview.classList.add('empty');
+  }
+  textarea.style.display = 'none';
+  preview.style.display = '';
 }
 
 function setPanelTab(tab) {
@@ -2546,13 +3035,467 @@ function confirmDeleteSubtask(cid, pid, tid, sid) {
 // ============================================================
 // SETTINGS VIEW
 // ============================================================
+const REPORTS_SECTIONS = [
+  { key: 'report',           icon: '📊', label: 'דוח שעות' },
+  { key: 'clockify-reports', icon: '⏱', label: 'דוחות Clockify' },
+  { key: 'daily-production', icon: '💰', label: 'ייצור יומי Clockify' },
+  { key: 'daily-local',      icon: '📋', label: 'ייצור יומי מקומי' },
+];
+
+function setReportsSection(key) {
+  state.reportsSection = key;
+  saveState(); renderMain();
+}
+
+function renderReportsHub() {
+  const section = state.reportsSection || 'report';
+
+  const tabs = REPORTS_SECTIONS.map(s =>
+    `<button class="reports-tab ${section === s.key ? 'active' : ''}" onclick="setReportsSection('${s.key}')">
+      <span>${s.icon}</span><span>${s.label}</span>
+    </button>`
+  ).join('');
+
+  let content = '';
+  if (section === 'report')                content = renderReportView();
+  else if (section === 'clockify-reports') content = renderClockifyReportsView();
+  else if (section === 'daily-production') content = renderDailyProductionView();
+  else if (section === 'daily-local')      content = renderDailyLocalView();
+
+  content = content.replace(/^<div class="report-container">/, '<div class="reports-hub-content">');
+
+  return `<div class="reports-hub-layout">
+    <div class="reports-hub-tabs">${tabs}</div>
+    <div class="reports-hub-body">${content}</div>
+  </div>`;
+}
+
 const SETTINGS_SECTIONS = [
   { key: 'business',     icon: '🏢', label: 'פרטי עסק' },
+  { key: 'backup',       icon: '💾', label: 'גיבוי ושחזור' },
   { key: 'integrations', icon: '🔗', label: 'אינטגרציות', header: true },
   { key: 'clockify',     icon: '⏱', label: 'Clockify' },
+  { key: 'claude',       icon: '🤖', label: 'Claude AI' },
   { key: 'greenapi',     icon: '💬', label: 'Green API' },
   { key: 'accounting',   icon: '📒', label: 'חשבונאות' },
 ];
+
+// ============================================================
+// CLOCKIFY REPORTS VIEW
+// ============================================================
+function renderClockifyReportsView() {
+  const apiKey = state.clockifyApiKey || state.integrations?.clockify?.apiKey;
+  if (!apiKey) return `<div class="report-container"><div class="empty-state"><div class="empty-icon">⏱</div><div>יש להגדיר מפתח API של Clockify בהגדרות תחילה</div></div></div>`;
+
+  const loaded  = Array.isArray(state._clockifyReportsList);
+  const reports = loaded ? state._clockifyReportsList : null;
+
+  if (reports === null) {
+    if (!state._clockifyReportsLoading) loadClockifyReportsList();
+    return `<div class="report-container"><div class="empty-state"><div class="empty-icon">⏳</div><div>טוען דוחות...</div></div></div>`;
+  }
+
+  const cards = reports.map(r => `
+    <div class="ck-report-card">
+      <div class="ck-report-card-info">
+        <div class="ck-report-card-name">${esc(r.name)}</div>
+        <div class="ck-report-card-type">${r.type || 'DETAILED'}</div>
+      </div>
+      <div class="ck-report-card-actions">
+        <a href="https://app.clockify.me/shared/${r.id}" target="_blank" class="btn btn-sm btn-secondary">👁 צפה</a>
+        <button class="btn btn-sm btn-danger" onclick="deleteClockifyReport('${r.id}')">🗑</button>
+      </div>
+    </div>`).join('');
+
+  const empty = reports.length === 0
+    ? `<div class="empty-state"><div class="empty-icon">📭</div><div>אין דוחות שיתופיים ב-Clockify</div></div>` : '';
+
+  return `<div class="report-container">
+    <div class="report-header">
+      <h2 class="report-title">⏱ דוחות Clockify</h2>
+      <span class="ck-reports-count">${reports.length} דוחות</span>
+      <button class="btn btn-secondary btn-sm" onclick="loadClockifyReportsList()" style="margin-right:auto">🔄 רענן</button>
+    </div>
+    ${empty}
+    <div class="ck-reports-list">${cards}</div>
+  </div>`;
+}
+
+async function loadClockifyReportsList() {
+  const apiKey = state.clockifyApiKey || state.integrations?.clockify?.apiKey;
+  const wsId   = CLOCKIFY_WORKSPACE;
+  state._clockifyReportsLoading = true;
+  state._clockifyReportsList    = null;
+  renderMain();
+  try {
+    const res = await fetch(`https://reports.api.clockify.me/v1/workspaces/${wsId}/shared-reports?page-size=200`, {
+      headers: { 'X-Api-Key': apiKey }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const raw = await res.json();
+    state._clockifyReportsList = Array.isArray(raw) ? raw : (raw.data || raw.reports || []);
+  } catch(e) {
+    showToast('שגיאה בטעינת דוחות: ' + e.message, 'error');
+    state._clockifyReportsList = [];
+  }
+  state._clockifyReportsLoading = false;
+  renderMain();
+}
+
+async function deleteClockifyReport(reportId) {
+  const apiKey = state.clockifyApiKey || state.integrations?.clockify?.apiKey;
+  const wsId   = CLOCKIFY_WORKSPACE;
+  try {
+    const res = await fetch(`https://reports.api.clockify.me/v1/workspaces/${wsId}/shared-reports/${reportId}`, {
+      method: 'DELETE',
+      headers: { 'X-Api-Key': apiKey }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    // Remove cached ID from clients/projects
+    for (const c of state.clients) {
+      if (c.clockifySharedReportId === reportId) delete c.clockifySharedReportId;
+      for (const p of (c.projects || [])) {
+        if (p.clockifySharedReportId === reportId) delete p.clockifySharedReportId;
+      }
+    }
+    saveState();
+    showToast('דוח נמחק ✓', 'success');
+    state._clockifyReportsList = (state._clockifyReportsList || []).filter(r => r.id !== reportId);
+    renderMain();
+  } catch(e) {
+    showToast('שגיאה במחיקת דוח: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// DAILY PRODUCTION VIEW
+// ============================================================
+function renderDailyProductionView() {
+  const apiKey = state.clockifyApiKey || state.integrations?.clockify?.apiKey;
+  if (!apiKey) return `<div class="report-container"><div class="empty-state"><div class="empty-icon">💰</div><div>יש להגדיר מפתח API של Clockify בהגדרות תחילה</div></div></div>`;
+
+  if (!state.dailyProdMonth) {
+    const now = new Date();
+    state.dailyProdMonth = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+  }
+  const [yr, mo] = state.dailyProdMonth.split('-').map(Number);
+  const monthStart = new Date(yr, mo-1, 1);
+  const monthEnd   = new Date(yr, mo, 0);
+  const label = monthStart.toLocaleDateString('he-IL', { year:'numeric', month:'long' });
+  const prevMonth = (() => { const d = new Date(yr, mo-2, 1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; })();
+  const nextMonth = (() => { const d = new Date(yr, mo,   1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; })();
+
+  const key  = `dailyProd_${state.dailyProdMonth}`;
+  const data = state[key];
+
+  const navHtml = `<div class="report-range-nav" style="margin-bottom:16px">
+      <button class="report-nav-btn" onclick="setDailyProdMonth('${prevMonth}')">&#x276F;</button>
+      <span class="report-range-label">${label}</span>
+      <button class="report-nav-btn" onclick="setDailyProdMonth('${nextMonth}')">&#x276E;</button>
+    </div>`;
+
+  if (data === undefined) {
+    loadDailyProduction(yr, mo);
+    return `<div class="report-container">${navHtml}<div class="empty-state"><div class="empty-icon">⏳</div><div>טוען נתונים...</div></div></div>`;
+  }
+  if (data === null) {
+    return `<div class="report-container">${navHtml}<div class="empty-state"><div class="empty-icon">⏳</div><div>טוען נתונים...</div></div></div>`;
+  }
+
+  // Build calendar grid
+  const daysInMonth = monthEnd.getDate();
+  const firstDow    = monthStart.getDay(); // 0=Sun
+  const todayStr    = new Date().toISOString().split('T')[0];
+
+  let totalSecs = 0, billableSecs = 0, totalEarned = 0;
+  let cells = '';
+
+  for (let i = 0; i < firstDow; i++) cells += `<div class="dp-cell dp-cell-empty"></div>`;
+
+  const maxDaySecs = Object.values(data).reduce((m, v) => {
+    const s = typeof v === 'number' ? v : (v?.total || 0);
+    return Math.max(m, s);
+  }, 0);
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dateStr  = `${yr}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const day      = data[dateStr] || { total: 0, billable: 0, earned: 0 };
+    const daySecs  = typeof day === 'number' ? day      : (day.total    || 0);
+    const dayBill  = typeof day === 'number' ? 0        : (day.billable || 0);
+    const dayEarned = typeof day === 'number' ? 0       : (day.earned   || 0);
+    totalSecs    += daySecs;
+    billableSecs += dayBill;
+    totalEarned  += dayEarned;
+    const money     = dayEarned ? Math.round(dayEarned) : null;
+    const alpha     = maxDaySecs > 0 && daySecs > 0 ? (0.08 + (daySecs / maxDaySecs) * 0.30).toFixed(2) : 0;
+    const isWeekend = (() => { const dow = new Date(yr, mo-1, d).getDay(); return dow === 5 || dow === 6; })();
+    cells += buildDpCell(d, dateStr, daySecs, dayBill, money, todayStr, isWeekend, alpha);
+  }
+
+  const effectiveRate = totalSecs > 0 && totalEarned ? (totalEarned / (totalSecs / 3600)).toFixed(0) : null;
+  const rateHint = !totalEarned && billableSecs === 0
+    ? `<div class="dp-rate-hint">לא נמצאו שעות לחיוב — הגדר תעריף ב-Clockify לפי לקוח/פרויקט</div>` : '';
+
+  return `<div class="report-container">
+    <div class="report-header">
+      <h2 class="report-title">💰 ייצור יומי</h2>
+      <button class="btn btn-secondary btn-sm" onclick="loadDailyProduction(${yr},${mo})">🔄 רענן</button>
+    </div>
+    ${navHtml}
+    ${rateHint}
+    <div class="dp-kpi-row">
+      <div class="dp-kpi">
+        <div class="dp-kpi-icon">⏱</div>
+        <div class="dp-kpi-label">שעות תועדו</div>
+        <div class="dp-kpi-value">${(totalSecs / 3600).toFixed(1)}</div>
+        <div class="dp-kpi-sub">שעות</div>
+      </div>
+      <div class="dp-kpi dp-kpi-blue">
+        <div class="dp-kpi-icon">💼</div>
+        <div class="dp-kpi-label">שעות לחיוב</div>
+        <div class="dp-kpi-value">${(billableSecs / 3600).toFixed(1)}</div>
+        <div class="dp-kpi-sub">${totalSecs > 0 ? Math.round(billableSecs/totalSecs*100) + '%' : '—'} מהסה"כ</div>
+      </div>
+      <div class="dp-kpi dp-kpi-green ${!totalEarned ? 'dp-kpi-dim' : ''}">
+        <div class="dp-kpi-icon">💰</div>
+        <div class="dp-kpi-label">הכנסה חודשית</div>
+        <div class="dp-kpi-value">${totalEarned ? `₪${Math.round(totalEarned).toLocaleString()}` : '—'}</div>
+        <div class="dp-kpi-sub">לפי תעריף Clockify</div>
+      </div>
+      <div class="dp-kpi ${!effectiveRate ? 'dp-kpi-dim' : ''}">
+        <div class="dp-kpi-icon">📈</div>
+        <div class="dp-kpi-label">₪ לשעת עבודה</div>
+        <div class="dp-kpi-value">${effectiveRate ? `₪${effectiveRate}` : '—'}</div>
+        <div class="dp-kpi-sub">כולל שעות לא לחיוב</div>
+      </div>
+    </div>
+    <div class="dp-dow-headers">
+      <div>א'</div><div>ב'</div><div>ג'</div><div>ד'</div><div>ה'</div><div>ו'</div><div>ש'</div>
+    </div>
+    <div class="dp-grid">${cells}</div>
+  </div>`;
+}
+
+function setDailyProdMonth(ym) {
+  state.dailyProdMonth = ym;
+  renderMain();
+}
+
+async function loadDailyProduction(yr, mo) {
+  const apiKey = state.clockifyApiKey || state.integrations?.clockify?.apiKey;
+  const wsId   = CLOCKIFY_WORKSPACE;
+  const start  = new Date(yr, mo-1, 1).toISOString();
+  const end    = new Date(yr, mo,   0, 23, 59, 59, 999).toISOString();
+  const key    = `dailyProd_${yr}-${String(mo).padStart(2,'0')}`;
+  state[key]   = null;
+  renderMain();
+  try {
+    // Use Detailed Reports API — returns billableAmount per entry based on Clockify rates
+    let page = 1, allEntries = [];
+    while (true) {
+      const res = await fetch(
+        `https://reports.api.clockify.me/v1/workspaces/${wsId}/reports/detailed`,
+        {
+          method: 'POST',
+          headers: { 'X-Api-Key': apiKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            dateRangeStart: start,
+            dateRangeEnd:   end,
+            dateRangeType:  'ABSOLUTE',
+            detailedFilter: { page, pageSize: 200, options: { totals: 'CALCULATE' } }
+          })
+        }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text()}`);
+      const data    = await res.json();
+      const entries = data.timeentries || data.timeEntries || [];
+      allEntries.push(...entries);
+      if (entries.length < 200) break;
+      page++;
+    }
+    const map = {};
+    for (const e of allEntries) {
+      const dateStr = (e.timeInterval?.start || e.startTime || '').split('T')[0];
+      if (!dateStr) continue;
+      const secs    = e.timeInterval?.duration != null
+        ? e.timeInterval.duration
+        : ((new Date(e.timeInterval?.end || e.endTime) - new Date(e.timeInterval?.start || e.startTime)) / 1000);
+      const earned  = e.billableAmount || 0;   // ₪ already calculated by Clockify
+      if (!map[dateStr]) map[dateStr] = { total: 0, billable: 0, earned: 0 };
+      map[dateStr].total    += secs;
+      map[dateStr].billable += e.billable ? secs : 0;
+      map[dateStr].earned   += earned;
+    }
+    state[key] = map;
+  } catch(err) {
+    showToast('שגיאה בטעינת נתוני ייצור: ' + err.message, 'error');
+    state[key] = {};
+  }
+  renderMain();
+}
+
+// ============================================================
+// DAILY LOCAL PRODUCTION VIEW
+// ============================================================
+function buildLocalDailyMap() {
+  // Returns { dateStr: { total: secs, billable: secs, earned: money } }
+  const map = {};
+  const defaultRate = parseFloat(state.business?.hourlyRate || 0);
+  for (const c of state.clients) {
+    const clientRate = parseFloat(c.defaultHourlyRate || 0) || defaultRate;
+    for (const p of (c.projects || [])) {
+      const rate = parseFloat(p.hourlyRate || 0) || clientRate;
+      const isBillable = !!p.billable;
+      // tasks
+      for (const t of (p.tasks || [])) {
+        for (const e of (t.timeEntries || [])) {
+          if (!e.date || !e.seconds) continue;
+          if (!map[e.date]) map[e.date] = { total: 0, billable: 0, earned: 0 };
+          map[e.date].total += e.seconds;
+          if (isBillable) {
+            map[e.date].billable += e.seconds;
+            map[e.date].earned  += (e.seconds / 3600) * rate;
+          }
+        }
+        // subtasks
+        for (const s of (t.subtasks || [])) {
+          for (const e of (s.timeEntries || [])) {
+            if (!e.date || !e.seconds) continue;
+            if (!map[e.date]) map[e.date] = { total: 0, billable: 0, earned: 0 };
+            map[e.date].total += e.seconds;
+            if (isBillable) {
+              map[e.date].billable += e.seconds;
+              map[e.date].earned  += (e.seconds / 3600) * rate;
+            }
+          }
+        }
+      }
+    }
+  }
+  return map;
+}
+
+function renderDailyLocalView() {
+  if (!state.dailyLocalMonth) {
+    const now = new Date();
+    state.dailyLocalMonth = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+  }
+  const [yr, mo] = state.dailyLocalMonth.split('-').map(Number);
+  const monthStart = new Date(yr, mo-1, 1);
+  const monthEnd   = new Date(yr, mo, 0);
+  const label      = monthStart.toLocaleDateString('he-IL', { year:'numeric', month:'long' });
+  const prevMonth  = (() => { const d = new Date(yr, mo-2, 1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; })();
+  const nextMonth  = (() => { const d = new Date(yr, mo,   1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; })();
+
+  const allData   = buildLocalDailyMap();
+  const defaultRate = parseFloat(state.business?.hourlyRate || 0);
+
+  const navHtml = `<div class="report-range-nav" style="margin-bottom:16px">
+    <button class="report-nav-btn" onclick="setDailyLocalMonth('${prevMonth}')">&#x276F;</button>
+    <span class="report-range-label">${label}</span>
+    <button class="report-nav-btn" onclick="setDailyLocalMonth('${nextMonth}')">&#x276E;</button>
+  </div>`;
+
+  const daysInMonth = monthEnd.getDate();
+  const firstDow    = monthStart.getDay();
+  const todayStr    = new Date().toISOString().split('T')[0];
+  const prefix      = `${yr}-${String(mo).padStart(2,'0')}`;
+
+  // KPI totals for the month
+  let totalSecs = 0, billableSecs = 0, totalEarned = 0;
+  for (let d = 1; d <= daysInMonth; d++) {
+    const ds = `${prefix}-${String(d).padStart(2,'0')}`;
+    const day = allData[ds];
+    if (!day) continue;
+    totalSecs    += day.total;
+    billableSecs += day.billable;
+    totalEarned  += day.earned;
+  }
+
+  const effectiveRate = totalSecs > 0 && totalEarned
+    ? (totalEarned / (totalSecs / 3600)).toFixed(0) : null;
+  const rateHint = !defaultRate && billableSecs === 0
+    ? `<div class="dp-rate-hint">הגדר תעריף שעתי בהגדרות → עסק, או ברמת פרויקט, כדי לראות הכנסות</div>` : '';
+
+  // Heat-map max
+  const maxSecs = Object.values(allData).reduce((m, v) => Math.max(m, v.total), 0);
+
+  let cells = '';
+  for (let i = 0; i < firstDow; i++) cells += `<div class="dp-cell dp-cell-empty"></div>`;
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dateStr  = `${prefix}-${String(d).padStart(2,'0')}`;
+    const day      = allData[dateStr] || { total: 0, billable: 0, earned: 0 };
+    const daySecs  = day.total;
+    const dayBill  = day.billable;
+    const dayMoney = day.earned ? Math.round(day.earned) : null;
+    const alpha    = maxSecs > 0 && daySecs > 0 ? (0.08 + (daySecs / maxSecs) * 0.30).toFixed(2) : 0;
+    const isWeekend = (() => { const dow = new Date(yr, mo-1, d).getDay(); return dow === 5 || dow === 6; })();
+
+    cells += buildDpCell(d, dateStr, daySecs, dayBill, dayMoney, todayStr, isWeekend, alpha);
+  }
+
+  return `<div class="report-container">
+    <div class="report-header">
+      <h2 class="report-title">📋 ייצור יומי מקומי</h2>
+    </div>
+    ${navHtml}
+    ${rateHint}
+    <div class="dp-kpi-row">
+      <div class="dp-kpi">
+        <div class="dp-kpi-icon">⏱</div>
+        <div class="dp-kpi-label">שעות תועדו</div>
+        <div class="dp-kpi-value">${(totalSecs / 3600).toFixed(1)}</div>
+        <div class="dp-kpi-sub">שעות</div>
+      </div>
+      <div class="dp-kpi dp-kpi-blue">
+        <div class="dp-kpi-icon">💼</div>
+        <div class="dp-kpi-label">שעות לחיוב</div>
+        <div class="dp-kpi-value">${(billableSecs / 3600).toFixed(1)}</div>
+        <div class="dp-kpi-sub">${totalSecs > 0 ? Math.round(billableSecs/totalSecs*100) + '%' : '—'} מהסה"כ</div>
+      </div>
+      <div class="dp-kpi dp-kpi-green ${!totalEarned ? 'dp-kpi-dim' : ''}">
+        <div class="dp-kpi-icon">💰</div>
+        <div class="dp-kpi-label">הכנסה חודשית</div>
+        <div class="dp-kpi-value">${totalEarned ? `₪${Math.round(totalEarned).toLocaleString()}` : '—'}</div>
+        <div class="dp-kpi-sub">${defaultRate ? `תעריף ₪${defaultRate}/ש` : 'לפי תעריף פרויקט'}</div>
+      </div>
+      <div class="dp-kpi ${!effectiveRate ? 'dp-kpi-dim' : ''}">
+        <div class="dp-kpi-icon">📈</div>
+        <div class="dp-kpi-label">₪ לשעת עבודה</div>
+        <div class="dp-kpi-value">${effectiveRate ? `₪${effectiveRate}` : '—'}</div>
+        <div class="dp-kpi-sub">כולל שעות לא לחיוב</div>
+      </div>
+    </div>
+    <div class="dp-dow-headers">
+      <div>א'</div><div>ב'</div><div>ג'</div><div>ד'</div><div>ה'</div><div>ו'</div><div>ש'</div>
+    </div>
+    <div class="dp-grid">${cells}</div>
+  </div>`;
+}
+
+function setDailyLocalMonth(ym) {
+  state.dailyLocalMonth = ym;
+  renderMain();
+}
+
+function buildDpCell(d, dateStr, daySecs, dayBill, dayMoney, todayStr, isWeekend, alpha) {
+  const isToday = dateStr === todayStr;
+  const dayRate = daySecs > 0 && dayMoney ? Math.round(dayMoney / (daySecs / 3600)) : null;
+  const bgStyle = daySecs > 0
+    ? `background:rgba(99,102,241,${alpha});border-color:rgba(99,102,241,${Math.min(1, +alpha + 0.15)})`
+    : '';
+  const stats = daySecs ? `
+    <div class="dp-stats">
+      <div class="dp-stat-row"><span class="dp-stat-label">תועדו</span><span class="dp-stat-val clr-hours">${formatTime(daySecs)}</span></div>
+      <div class="dp-stat-row"><span class="dp-stat-label">לחיוב</span><span class="dp-stat-val clr-bill">${formatTime(dayBill)}</span></div>
+      <div class="dp-stat-row"><span class="dp-stat-label">הכנסה</span><span class="dp-stat-val clr-money">${dayMoney ? '₪' + dayMoney : '—'}</span></div>
+      <div class="dp-stat-row"><span class="dp-stat-label">₪/שעה</span><span class="dp-stat-val clr-rate">${dayRate ? '₪' + dayRate : '—'}</span></div>
+    </div>` : '';
+  return `<div class="dp-cell ${isToday ? 'dp-cell-today' : ''} ${isWeekend ? 'dp-cell-weekend' : ''}" style="${bgStyle}">
+    <span class="dp-day-num">${d}</span>${stats}
+  </div>`;
+}
 
 function setSettingsSection(key) {
   state.settingsSection = key;
@@ -2562,9 +3505,10 @@ function setSettingsSection(key) {
 function renderSettingsView() {
   const section = state.settingsSection || 'business';
   const b  = state.business     || {};
-  const ci = (state.integrations || {}).clockify   || {};
-  const gi = (state.integrations || {}).greenapi   || {};
-  const ai = (state.integrations || {}).accounting || {};
+  const ci  = (state.integrations || {}).clockify   || {};
+  const gi  = (state.integrations || {}).greenapi   || {};
+  const ai  = (state.integrations || {}).accounting || {};
+  const cli = (state.integrations || {}).claude     || {};
 
   // ---- Sidebar nav ----
   let navHtml = '';
@@ -2617,10 +3561,48 @@ function renderSettingsView() {
             <label>לוגו (URL תמונה)</label>
             <input id="s-biz-logo" class="settings-input" value="${esc(b.logoUrl||'')}" placeholder="https://...">
           </div>
+          <div class="settings-field">
+            <label>תעריף שעתי (₪)</label>
+            <input id="s-biz-rate" class="settings-input" type="number" min="0" value="${esc(b.hourlyRate||'')}" placeholder="0">
+          </div>
         </div>
       </div>
       <div class="settings-actions">
         <button class="btn btn-primary" onclick="saveBusinessSettings()">💾 שמור שינויים</button>
+      </div>`;
+  }
+
+  else if (section === 'backup') {
+    const lastBackup  = state._lastManualBackup ? new Date(state._lastManualBackup).toLocaleString('he-IL') : 'לא בוצע עדיין';
+    const clientCount = (state.clients || []).filter(c => !c.archived).length;
+    const taskCount   = (state.clients || []).reduce((n, c) => n + (c.projects || []).reduce((m, p) => m + (p.tasks || []).length, 0), 0);
+    content = `
+      <div class="settings-section-title">💾 גיבוי ושחזור</div>
+      <div class="settings-card">
+        <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px">
+          מצב נוכחי: <strong style="color:var(--text)">${clientCount} לקוחות, ${taskCount} משימות</strong>
+          &nbsp;·&nbsp; גיבוי אחרון: <strong style="color:var(--text)">${lastBackup}</strong>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div class="settings-card" style="margin:0;padding:16px">
+            <div style="font-weight:600;margin-bottom:6px">📤 ייצוא גיבוי</div>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">מוריד קובץ JSON עם כל הנתונים — לקוחות, פרויקטים, משימות, הגדרות</div>
+            <button class="btn btn-primary" onclick="exportBackup()">⬇ הורד גיבוי עכשיו</button>
+          </div>
+          <div class="settings-card" style="margin:0;padding:16px">
+            <div style="font-weight:600;margin-bottom:6px">📥 ייבוא גיבוי</div>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">שחזור מקובץ JSON שיוצא קודם — <strong>ידרוס את כל הנתונים הנוכחיים</strong></div>
+            <label class="btn btn-ghost" style="cursor:pointer">
+              ⬆ בחר קובץ גיבוי
+              <input type="file" accept=".json" style="display:none" onchange="importBackup(this)">
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="settings-card" style="background:#fffbeb;border-color:#fde68a">
+        <div style="font-size:13px;color:#92400e">
+          <strong>💡 טיפ:</strong> ייצא גיבוי לאחר כל יום עבודה ושמור בתיקיית OneDrive / Google Drive להגנה מקסימלית.
+        </div>
       </div>`;
   }
 
@@ -2655,6 +3637,32 @@ function renderSettingsView() {
       </div>
       <div class="settings-actions">
         <button class="btn btn-primary" onclick="saveClockifySettings()">💾 שמור</button>
+      </div>`;
+  }
+
+  else if (section === 'claude') {
+    const connected = !!cli.apiKey;
+    content = `
+      <div class="settings-section-title">🤖 Claude AI</div>
+      <div class="settings-integration-hero ${connected ? 'connected' : ''}">
+        <div class="integration-logo">🤖</div>
+        <div class="integration-hero-info">
+          <div class="integration-hero-name">Claude AI (Anthropic)</div>
+          <div class="integration-hero-desc">יצירת שמות חכמים למשימות — הקלד תוכן ולחץ Shift+Enter</div>
+        </div>
+        <span class="integration-status-badge ${connected ? 'on' : 'off'}">${connected ? '● מחובר' : '○ לא מחובר'}</span>
+      </div>
+      <div class="settings-card">
+        <div class="settings-grid">
+          <div class="settings-field settings-field-full">
+            <label>API Key</label>
+            <input id="s-claude-apikey" class="settings-input" type="password" value="${esc(cli.apiKey || '')}" placeholder="sk-ant-...">
+            <span class="settings-hint">נמצא בדשבורד Anthropic &rarr; console.anthropic.com &rarr; API Keys</span>
+          </div>
+        </div>
+      </div>
+      <div class="settings-actions">
+        <button class="btn btn-primary" onclick="saveClaudeSettings()">💾 שמור</button>
       </div>`;
   }
 
@@ -2709,7 +3717,8 @@ function saveBusinessSettings() {
     address: document.getElementById('s-biz-address')?.value || '',
     taxId:   document.getElementById('s-biz-taxid')?.value   || '',
     website: document.getElementById('s-biz-website')?.value || '',
-    logoUrl: document.getElementById('s-biz-logo')?.value    || '',
+    logoUrl:    document.getElementById('s-biz-logo')?.value    || '',
+    hourlyRate: document.getElementById('s-biz-rate')?.value    || '',
   };
   saveState();
   showToast('פרטי עסק נשמרו ✓', 'success');
@@ -2728,6 +3737,154 @@ function saveClockifySettings() {
   saveState();
   showToast('הגדרות Clockify נשמרו ✓', 'success');
   renderMain();
+}
+
+// ============================================================
+// BACKUP / RESTORE
+// ============================================================
+function exportBackup() {
+  const now     = new Date();
+  const pad     = n => String(n).padStart(2, '0');
+  const stamp   = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}`;
+  const data    = JSON.stringify(state, null, 2);
+  const blob    = new Blob([data], { type: 'application/json' });
+  const url     = URL.createObjectURL(blob);
+  const a       = document.createElement('a');
+  a.href        = url;
+  a.download    = `taskmanager_backup_${stamp}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  state._lastManualBackup = Date.now();
+  saveState();
+  showToast('גיבוי הורד בהצלחה ✓', 'success');
+  renderMain();
+}
+
+function importBackup(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const saved = JSON.parse(e.target.result);
+      if (!saved.clients) { showToast('קובץ לא תקין — חסר שדה clients', 'error'); return; }
+      if (!confirm(`ייבוא יחליף את כל הנתונים הנוכחיים.\n${saved.clients.length} לקוחות בקובץ.\nלהמשיך?`)) return;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+      loadState();
+      render();
+      showToast(`יובאו ${saved.clients.length} לקוחות בהצלחה ✓`, 'success');
+    } catch(err) {
+      showToast('שגיאה בקריאת הקובץ', 'error');
+    }
+  };
+  reader.readAsText(file);
+  input.value = '';
+}
+
+function saveClaudeSettings() {
+  const apiKey = document.getElementById('s-claude-apikey')?.value?.trim() || '';
+  if (!state.integrations) state.integrations = {};
+  if (!state.integrations.claude) state.integrations.claude = {};
+  state.integrations.claude.apiKey = apiKey;
+  saveState();
+  showToast('הגדרות Claude AI נשמרו ✓', 'success');
+  renderMain();
+}
+
+async function callClaudeApi(description) {
+  const apiKey = state.integrations?.claude?.apiKey;
+  if (!apiKey) return null;
+  try {
+    const resp = await fetch('/.netlify/functions/claude', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        apiKey,
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 30,
+        system: 'אתה מחולל כותרות קצרות למשימות בעברית. הכלל: החזר 3-5 מילים בלבד — ללא פסיק, ללא נקודה, ללא הסבר, ללא markdown, ללא #, ללא כוכביות. מילים בלבד.',
+        messages: [{ role: 'user', content: description }]
+      })
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      console.error('Claude API error:', resp.status, err);
+      showToast(`שגיאת Claude API: ${resp.status}`, 'error');
+      return null;
+    }
+    const data = await resp.json();
+    const raw = data.content?.[0]?.text?.trim() || null;
+    if (!raw) return null;
+    // Strip markdown symbols and clean up
+    const title = raw.replace(/^#+\s*/g, '').replace(/[*_`]/g, '').trim();
+    // Guard: if the model returned the full description, discard it
+    if (title && title.split(' ').length <= 8) return title;
+    return null;
+  } catch (err) {
+    console.error('Claude fetch error:', err);
+    showToast('לא ניתן לגשת ל-Claude API — בדוק חיבור ומפתח', 'error');
+    return null;
+  }
+}
+
+async function quickAddWithAI() {
+  const apiKey = state.integrations?.claude?.apiKey;
+  if (!apiKey) {
+    showToast('הגדר Claude API key בהגדרות → Claude AI', 'error');
+    return;
+  }
+
+  const input = document.getElementById('quick-add-input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+
+  const { title: description, projectName, tags, dueDate } = parseQuickInput(text);
+  if (!description) { showToast('הכנס תוכן למשימה', 'error'); return; }
+
+  input.disabled = true;
+  const origPlaceholder = input.placeholder;
+  input.placeholder = '✨ AI מייצר שם...';
+
+  try {
+    const aiTitle = await callClaudeApi(description);
+    if (!aiTitle) return; // error already shown by callClaudeApi
+    const title = aiTitle;
+
+    let cid, pid;
+    if (projectName) {
+      const found = findProjectByName(projectName);
+      if (!found) {
+        _aiTaskDescription = description;
+        showQuickProjectModal(title, tags, dueDate, projectName);
+        return;
+      }
+      cid = found.cid; pid = found.pid;
+    } else if (state.currentView === 'project' && state.selectedClientId && state.selectedProjectId) {
+      cid = state.selectedClientId; pid = state.selectedProjectId;
+    } else {
+      _aiTaskDescription = description;
+      showQuickProjectModal(title, tags, dueDate, '');
+      return;
+    }
+
+    addTask(cid, pid, { title, description, tags, dueDate });
+    input.value = '';
+    document.getElementById('quick-add-preview').innerHTML = '';
+    document.getElementById('quick-suggestions')?.classList.remove('open');
+
+    if (state.currentView !== 'project' || state.selectedProjectId !== pid) {
+      state.selectedClientId = cid; state.selectedProjectId = pid;
+      state.currentView = 'project'; state.filters.status = STATUS.OPEN;
+      saveState();
+    }
+    render();
+    showToast(`✨ "${title}"`, 'success');
+  } finally {
+    input.disabled = false;
+    input.placeholder = origPlaceholder;
+    input.focus();
+  }
 }
 
 // ============================================================
@@ -2993,7 +4150,7 @@ function renderQuickAddBar() {
     <div class="quick-add-bar">
       <span class="quick-add-icon">＋</span>
       <input class="quick-add-input" id="quick-add-input"
-        placeholder="הוסף משימה... #פרויקט @תגית $מחר / $שני / 25/12/26"
+        placeholder="הוסף משימה... #פרויקט @תגית $מחר | Shift+Enter = ✨ AI שם"
         onkeydown="quickAddKeydown(event)"
         oninput="quickAddInput()"
         autocomplete="off" spellcheck="false">
@@ -3121,6 +4278,8 @@ function quickAddKeydown(e) {
       // Select the first (highlighted) suggestion instead of submitting
       const first = box.querySelector('.qsugg-item');
       if (first) first.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    } else if (e.shiftKey) {
+      quickAddWithAI();
     } else {
       submitQuickTask();
     }
@@ -3284,6 +4443,8 @@ function switchQClient(mode) {
 
 function submitQuickProjectChoice(taskTitle, tagsJson, dueDate) {
   const tags = JSON.parse(tagsJson || '[]');
+  const description = _aiTaskDescription || '';
+  _aiTaskDescription = null;
 
   const existingTab = document.getElementById('qtab-existing');
   const useExisting = existingTab && existingTab.style.display !== 'none';
@@ -3292,7 +4453,7 @@ function submitQuickProjectChoice(taskTitle, tagsJson, dueDate) {
     const val = document.getElementById('f-existing-proj')?.value;
     if (!val) { showToast('בחר פרויקט', 'error'); return; }
     const [cid, pid] = val.split('|');
-    addTask(cid, pid, { title: taskTitle, tags, dueDate });
+    addTask(cid, pid, { title: taskTitle, description, tags, dueDate });
     _quickAddDone(cid, pid, 'משימה נוספה ✓');
   } else {
     const projName = document.getElementById('f-qp-name')?.value?.trim();
@@ -3312,7 +4473,7 @@ function submitQuickProjectChoice(taskTitle, tagsJson, dueDate) {
     }
 
     const p = addProject(cid, { name: projName, color });
-    addTask(cid, p.id, { title: taskTitle, tags, dueDate });
+    addTask(cid, p.id, { title: taskTitle, description, tags, dueDate });
     _quickAddDone(cid, p.id, 'פרויקט ומשימה נוצרו ✓');
   }
 }
@@ -3378,8 +4539,10 @@ function submitQuickTask() {
 // INIT
 // ============================================================
 function init() {
+  initSupabase();
   loadState();
   render();
+  syncFromSupabase(); // async — updates state & re-renders when Supabase data arrives
   // Close suggestions when clicking outside
   document.addEventListener('click', (e) => {
     if (!e.target.closest('.quick-add-wrap')) {

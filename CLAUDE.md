@@ -34,9 +34,15 @@ Each task has: `id, title, description, priority (high/medium/low), tags[], dueD
 
 **Modal system** — `showModal(html, onSubmit)` renders a form into `#modal-box`. Submit handler reads form values and calls the appropriate CRUD function.
 
-**Clockify integration** — Bidirectional sync: `startTimer()` immediately opens a Clockify entry (stored as `state.activeTimer.clockifyEntryId`); `stopTimer()` closes it. If no entry was opened (or elapsed < 60s), stop falls back to posting a completed entry. Workspace ID and User ID are hardcoded constants (`CLOCKIFY_WORKSPACE`, `CLOCKIFY_USER_ID`). The API key has a hardcoded default in `defaultState()` but is overridable via the UI and persisted in `state.clockifyApiKey`.
+**Clockify integration** — Bidirectional sync: `startTimer()` immediately opens a Clockify entry (stored as `state.activeTimer.clockifyEntryId`); `stopTimer()` closes it. If no entry was opened (or elapsed < 60s), stop falls back to posting a completed entry. Workspace ID and User ID are hardcoded constants (`CLOCKIFY_WORKSPACE`, `CLOCKIFY_USER_ID`). The API key lives in `state.integrations.clockify.apiKey` (old `state.clockifyApiKey` is migrated on load).
 
 **Move task** — `moveTask(tid, fromCid, fromPid, toCid, toPid)` relocates a task between projects and updates the active timer context if that task is running.
+
+**Task panel tabs** — The panel (`#task-panel`) has two tabs controlled by the module-level `panelActiveTab` variable: `'details'` and `'log'`.
+
+**Settings** — `state.settingsSection` tracks which settings page is active (`'business'`, etc.). `state.business` holds business profile fields. `state.integrations` holds sub-objects for `clockify`, `greenapi`, and `accounting`.
+
+**Views** — `currentView` is one of `'today' | 'client' | 'project' | 'report' | 'archive'`.
 
 ## Conventions
 
@@ -44,4 +50,4 @@ Each task has: `id, title, description, priority (high/medium/low), tags[], dueD
 - Always use the `esc()` utility when interpolating user data into HTML strings to prevent XSS.
 - IDs are generated with `uuid()` (wraps `crypto.randomUUID`).
 - Default filter on load: `status = 'open'`.
-- `currentView` is one of `'today' | 'client' | 'project'`.
+- `in-progress` status is **derived at render time** (task has active timer), not stored — stored tasks only have `open` or `done`.
